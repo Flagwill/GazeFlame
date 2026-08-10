@@ -1,0 +1,29 @@
+# GazeFlame — GazeTR + FLAME_PyTorch 合并项目的 conda 环境定义
+#
+# 创建环境:
+#   conda env create -f environment.yml
+# 或（若环境已存在，仅更新依赖）:
+#   conda env update -f environment.yml
+#
+# 注意: FLAME_PyTorch 依赖较老, 使用 Python 3.8 以匹配其设计目标。
+# 若 pyrender==0.1.39 在安装时编译失败, 可放宽为 pyrender (最新版 API 兼容)。
+
+name: gaze_flame
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.8
+  - pip
+  - pip:
+      - numpy==1.18.1
+      - torch
+      - torchvision
+      - pyrender==0.1.39
+      - trimesh==3.6.18
+      - smplx
+      - opencv-python
+      - matplotlib
+      - PyYAML
+      - easydict
+      - git+https://github.com/ildoonet/pytorch-gradual-warmup-lr.git
