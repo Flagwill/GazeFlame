@@ -16,7 +16,11 @@ dependencies:
   - python=3.8
   - pip
   - pip:
-      - numpy==1.18.1
+      # 版本说明:
+#   - numpy 1.23.5: 满足 torch 2.4.1 (需>=1.21) 且保留 np.bool 等别名 (1.24 移除),
+#     trimesh 3.6.18 依赖这些别名才能 import
+#   - torch 2.4.1: Python 3.8 可用, 无 NVIDIA GPU 时自动退化为 CPU 运行
+      - numpy==1.23.5
       - torch
       - torchvision
       - pyrender==0.1.39
