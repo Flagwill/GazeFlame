@@ -93,12 +93,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    gazetr_root = Path(args.gazetr_root)
-    flame_root = Path(args.flame_root)
-    model_path = Path(args.model)
-    image_path = Path(args.image)
+    gazetr_root = Path(args.gazetr_root).resolve()
+    flame_root = Path(args.flame_root).resolve()
+    # 解析为绝对路径: 子进程的 cwd 是 gazetr_root/flame_root, 相对路径必须基于调用方的 cwd 解析,
+    # 否则在子进程内会找错位置。
+    model_path = Path(args.model).resolve()
+    image_path = Path(args.image).resolve()
+    image_folder = Path(args.image_folder).resolve() if args.image_folder else None
 
-    gaze_viewer = Path(args.gaze_viewer) if args.gaze_viewer else flame_root / "gaze_viewer.py"
+    gaze_viewer = Path(args.gaze_viewer).resolve() if args.gaze_viewer else flame_root / "gaze_viewer.py"
 
     if not model_path.exists():
         raise FileNotFoundError(f"模型不存在: {model_path}")
@@ -112,8 +115,8 @@ def main() -> None:
             str(gazetr_root / "inference.py"),
             "--model", str(model_path),
         ]
-        if args.image_folder:
-            inference_args += ["--image_folder", args.image_folder]
+        if image_folder:
+            inference_args += ["--image_folder", str(image_folder)]
         else:
             if not image_path.exists():
                 raise FileNotFoundError(f"图片不存在: {image_path}")
