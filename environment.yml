@@ -15,6 +15,11 @@ channels:
 dependencies:
   - python=3.8
   - pip
+  # dlib (人脸检测/对齐, ETH-XGaze 官方同款):
+  #   注意: conda-forge 的 dlib 会把 numpy 升到 1.24+, 而 trimesh 3.6.18 需要
+  #   numpy 1.23.5 (np.bool 等别名)。创建/更新环境后请务必执行:
+  #     pip install --force-reinstall numpy==1.23.5
+  - dlib
   - pip:
       # 版本说明:
 #   - numpy 1.23.5: 满足 torch 2.4.1 (需>=1.21) 且保留 np.bool 等别名 (1.24 移除),

@@ -36,7 +36,11 @@ import cv2
 import numpy as np
 import torch
 
+# 让 gazetr/inference.py 也能以 cwd=gazetr 独立运行时导入顶层 common 包。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import model
+from common.face import align_face_to_gaze_crop, draw_aligned_overlay
 from gtools import gazeto3d
 
 # Supported input image extensions (upper/lower case).
@@ -113,6 +117,70 @@ def collect_image_paths(image_path: str | None, image_folder: str | None) -> lis
     if not paths:
         raise FileNotFoundError(f"文件夹中没有找到图片: {image_folder}")
     return paths
+
+
+def prepare_input_image(
+    image_path: str,
+    img_bgr: np.ndarray,
+    align: bool,
+    align_dir: str | None,
+    verbose: bool = True,
+) -> tuple[np.ndarray, int]:
+    """Return ``(img_bgr, face_count)``, aligning the face when requested.
+
+    Runs ETH-XGaze face detection + normalization (``common.face``) so GazeTR
+    sees a training-like normalized crop.  Falls back to the raw image (naive
+    resize) when no face is found or dlib fails.
+    """
+    if not align:
+        return img_bgr, 0
+    try:
+        crop, info = align_face_to_gaze_crop(img_bgr)
+        if crop is None:
+            if verbose:
+                print("  警告: 未检测到人脸，回退到直接缩放整图")
+            return img_bgr, 0
+        if align_dir:
+            save_path = os.path.join(align_dir, Path(image_path).stem + "_aligned.png")
+            cv2.imwrite(save_path, draw_aligned_overlay(crop, info["warped_landmarks6"]))
+        return crop, int(info["face_count"])
+    except Exception as exc:  # dlib / pose estimation failure: degrade gracefully
+        if verbose:
+            print(f"  警告: 人脸对齐失败 ({exc})，回退到直接缩放整图")
+        return img_bgr, 0
+
+
+def predict_gaze(
+    net,
+    img_bgr: np.ndarray,
+    device="cpu",
+    align: bool = True,
+) -> tuple[float, float, int, np.ndarray, dict | None]:
+    """Run GazeTR on a single BGR frame.
+
+    Returns ``(pitch, yaw, face_count, prep_bgr, info)`` where ``prep_bgr`` is
+    the crop actually fed to the model and ``info`` is the alignment dict from
+    ``common.face`` (contains ``rect``/``landmarks6`` for overlays, or None).
+    Falls back to the raw image when no face is found or alignment fails.
+    """
+    info: dict | None = None
+    prep_bgr = img_bgr
+    face_count = 0
+    if align:
+        try:
+            crop, info = align_face_to_gaze_crop(img_bgr)
+            if crop is not None:
+                prep_bgr = crop
+                face_count = int(info["face_count"])
+            else:
+                info = None  # no face found
+        except Exception:  # noqa: BLE001 - keep the live loop resilient
+            info = None
+
+    tensor = preprocess_image(prep_bgr, device)
+    with torch.no_grad():
+        gaze = net({"face": tensor}).cpu().numpy()[0]
+    return float(gaze[0]), float(gaze[1]), int(face_count), prep_bgr, info
 
 
 # --------------------------------------------------------------------------
@@ -214,6 +282,8 @@ def inference(
     vis_dir: str = "vis_results",
     line_thickness: int = 2,
     popup: bool = False,
+    align: bool = True,
+    align_out: str | None = None,
 ) -> tuple[list[dict], int]:
     """Run GazeTR over ``image_paths``.
 
@@ -228,6 +298,8 @@ def inference(
         vis_dir: Directory for visualizations.
         line_thickness: Line width used by the 3D visualization.
         popup: Whether to show a blocking per-image popup window.
+        align: Whether to detect + normalize faces (ETH-XGaze style) first.
+        align_out: Directory to save aligned crops with landmarks (debug).
 
     Returns:
         ``(results, saved_vis_count)``.
@@ -243,6 +315,11 @@ def inference(
         vis_dir = os.path.abspath(vis_dir)
         os.makedirs(vis_dir, exist_ok=True)
 
+    align_dir = os.path.abspath(align_out) if align_out else None
+    if align_dir:
+        os.makedirs(align_dir, exist_ok=True)
+        print(f"对齐裁剪图将保存到: {align_dir}")
+
     with torch.no_grad():
         processed = 0
         for start in range(0, len(image_paths), batch_size):
@@ -257,12 +334,17 @@ def inference(
             if not loaded:
                 continue
 
+            prepared = [
+                (image_path, bgr, prepare_input_image(image_path, bgr, align, align_dir))
+                for image_path, bgr in loaded
+            ]
             inputs = torch.cat(
-                [preprocess_image(bgr, device) for _, bgr in loaded], dim=0
+                [preprocess_image(prep_bgr, device) for _, _, (prep_bgr, _) in prepared],
+                dim=0,
             )
             gaze_pred = net({"face": inputs}).cpu().numpy()
 
-            for (image_path, bgr), gaze in zip(loaded, gaze_pred):
+            for (image_path, bgr, (_, face_count)), gaze in zip(prepared, gaze_pred):
                 processed += 1
                 pitch, yaw = float(gaze[0]), float(gaze[1])
                 result = {
@@ -275,6 +357,8 @@ def inference(
                 results.append(result)
 
                 print(f"[{processed}/{len(image_paths)}] {Path(image_path).name}")
+                if align and face_count > 0:
+                    print(f"  人脸: 已对齐 → ETH-XGaze 归一化裁剪 (224x224)")
                 print(
                     f"  Pitch: {result['pitch']:.4f} rad ({result['pitch_deg']:.2f}°)"
                 )
@@ -380,6 +464,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="每次前向推理的图片数量 (默认: 16)",
     )
     parser.add_argument(
+        "--align", dest="align", action="store_true", default=True,
+        help="检测并对齐人脸 (ETH-XGaze 归一化到 224x224) 后再推理 (默认开启)",
+    )
+    parser.add_argument(
+        "--no-align", dest="align", action="store_false",
+        help="关闭人脸检测/对齐, 直接把输入缩放到 224x224 (用于已裁剪好的数据)",
+    )
+    parser.add_argument(
+        "--align-out", type=str, default=None,
+        help="把对齐后的 224x224 人脸裁剪图(带关键点)保存到该目录, 便于调试",
+    )
+    parser.add_argument(
         "--device", "-d", type=str, default="cuda", choices=["cuda", "cpu"],
         help="使用的设备 (默认: cuda; 无 GPU 时自动回退 cpu)",
     )
@@ -421,6 +517,8 @@ def main() -> int:
         vis_dir=args.vis_dir,
         line_thickness=args.line_thickness,
         popup=args.popup,
+        align=args.align,
+        align_out=args.align_out,
     )
 
     if args.draw_gaze and saved_vis_count == 0:

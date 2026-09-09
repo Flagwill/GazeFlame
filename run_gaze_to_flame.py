@@ -71,6 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-viewer", action="store_true",
                         help="Only run GazeTR and print pitch/yaw/gaze; "
                              "do not launch the FLAME viewer")
+    parser.add_argument("--no-align", action="store_true",
+                        help="Disable face detection/alignment (ETH-XGaze "
+                             "normalization) in the GazeTR stage")
+    parser.add_argument("--align-out", default=None,
+                        help="Save aligned 224x224 face crops (with landmarks) "
+                             "to this directory for debugging")
     parser.add_argument("--save-image", default=None,
                         help="Passed to the viewer: also render the scene to a PNG")
     parser.add_argument("--headless", action="store_true",
@@ -113,6 +119,10 @@ def main() -> None:
                 raise FileNotFoundError(f"图片不存在: {image_path}")
             inference_args += ["--image", str(image_path)]
         inference_args += ["--output", str(result_file), "--device", args.device]
+        if args.no_align:
+            inference_args += ["--no-align"]
+        if args.align_out:
+            inference_args += ["--align-out", str(Path(args.align_out).resolve())]
         run_python(inference_args, cwd=gazetr_root)
 
         pitch_yaw = read_gaze_result(result_file)
