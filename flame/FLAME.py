@@ -40,7 +40,6 @@ class FLAME(nn.Module):
     """
     def __init__(self, config):
         super(FLAME, self).__init__()
-        print("creating the FLAME Decoder")
         with open(config.flame_model_path, 'rb') as f:
             self.flame_model = Struct(**pickle.load(f, encoding='latin1'))
         self.NECK_IDX = 1
@@ -144,7 +143,7 @@ class FLAME(nn.Module):
 
             dynamic_lmk_bary_coords = conture_embeddings['lmk_b_coords']
             dynamic_lmk_bary_coords = torch.tensor(
-                dynamic_lmk_bary_coords, dtype=self.dtype)
+                np.asarray(dynamic_lmk_bary_coords), dtype=self.dtype)
             self.register_buffer('dynamic_lmk_bary_coords',
                                  dynamic_lmk_bary_coords)
 

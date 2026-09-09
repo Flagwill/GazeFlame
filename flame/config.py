@@ -1,110 +1,109 @@
+"""FLAME model configuration.
+
+This module defines the hyper-parameters consumed by :class:`FLAME` as a
+plain dataclass (``FLAMEConfig``) and helpers to build it from argparse.
+
+It deliberately avoids a module-level ``parser`` object: importing this
+module must not have side effects, and callers (e.g. ``gaze_viewer.py``)
+build their own ``argparse.ArgumentParser`` and merge these options into it.
+"""
+
+from __future__ import annotations
+
 import argparse
-import os
+from dataclasses import dataclass
 
-parser = argparse.ArgumentParser(description = 'FLAME model')
+FLAME_DEFAULT_MODEL_DIR = "./model"
 
-parser.add_argument(
-    '--flame_model_path',
-    type = str,
-    default = './model/generic_model.pkl',
-    help = 'flame model path'
-)
 
-parser.add_argument(
-    '--static_landmark_embedding_path',
-    type = str,
-    default = './model/flame_static_embedding.pkl',
-    help = 'Static landmark embeddings path for FLAME'
-)
+@dataclass
+class FLAMEConfig:
+    """Hyper-parameters for the FLAME model and its forward pass."""
 
-parser.add_argument(
-    '--dynamic_landmark_embedding_path',
-    type = str,
-    default = './model/flame_dynamic_embedding.npy',
-    help = 'Dynamic contour embedding path for FLAME'
-)
+    flame_model_path: str = f"{FLAME_DEFAULT_MODEL_DIR}/generic_model.pkl"
+    static_landmark_embedding_path: str = (
+        f"{FLAME_DEFAULT_MODEL_DIR}/flame_static_embedding.pkl"
+    )
+    dynamic_landmark_embedding_path: str = (
+        f"{FLAME_DEFAULT_MODEL_DIR}/flame_dynamic_embedding.npy"
+    )
 
-# FLAME hyper-parameters
+    # FLAME hyper-parameters
+    shape_params: int = 100
+    expression_params: int = 50
+    pose_params: int = 6
 
-parser.add_argument(
-    '--shape_params',
-    type = int,
-    default = 100,
-    help = 'the number of shape parameters'
-)
+    # Forward-pass flags
+    use_face_contour: bool = True
+    use_3D_translation: bool = True
+    optimize_eyeballpose: bool = True
+    optimize_neckpose: bool = True
+    batch_size: int = 8
 
-parser.add_argument(
-    '--expression_params',
-    type = int,
-    default = 50,
-    help = 'the number of expression parameters'
-)
+    # Training-only (kept for upstream compatibility)
+    num_worker: int = 4
+    ring_margin: float = 0.5
+    ring_loss_weight: float = 1.0
 
-parser.add_argument(
-    '--pose_params',
-    type = int,
-    default = 6,
-    help = 'the number of pose parameters'
-)
 
-# Training hyper-parameters
+def add_flame_args(parser: argparse.ArgumentParser) -> None:
+    """Add FLAME model options to an existing argparse parser."""
+    parser.add_argument("--flame_model_path", type=str, default=FLAMEConfig.flame_model_path,
+                        help="FLAME model path")
+    parser.add_argument("--static_landmark_embedding_path", type=str,
+                        default=FLAMEConfig.static_landmark_embedding_path,
+                        help="Static landmark embeddings path for FLAME")
+    parser.add_argument("--dynamic_landmark_embedding_path", type=str,
+                        default=FLAMEConfig.dynamic_landmark_embedding_path,
+                        help="Dynamic contour embedding path for FLAME")
 
-parser.add_argument(
-    '--use_face_contour',
-    default = True,
-    type = bool,
-    help = 'If true apply the landmark loss on also on the face contour.'
-)
+    parser.add_argument("--shape_params", type=int, default=FLAMEConfig.shape_params,
+                        help="The number of shape parameters")
+    parser.add_argument("--expression_params", type=int,
+                        default=FLAMEConfig.expression_params,
+                        help="The number of expression parameters")
+    parser.add_argument("--pose_params", type=int, default=FLAMEConfig.pose_params,
+                        help="The number of pose parameters")
 
-parser.add_argument(
-    '--use_3D_translation',
-    default = True, # Flase for RingNet project
-    type = bool,
-    help = 'If true apply the landmark loss on also on the face contour.'
-)
+    parser.add_argument("--use_face_contour", action="store_true",
+                        default=FLAMEConfig.use_face_contour,
+                        help="Apply the landmark loss on the face contour too")
+    parser.add_argument("--use_3D_translation", action="store_true",
+                        default=FLAMEConfig.use_3D_translation,
+                        help="Apply landmark loss on the face contour too")
+    parser.add_argument("--optimize_eyeballpose", action="store_true",
+                        default=FLAMEConfig.optimize_eyeballpose,
+                        help="If true optimize for the eyeball pose")
+    parser.add_argument("--optimize_neckpose", action="store_true",
+                        default=FLAMEConfig.optimize_neckpose,
+                        help="If true optimize for the neck pose")
+    parser.add_argument("--batch_size", type=int, default=FLAMEConfig.batch_size,
+                        help="Batch size")
 
-parser.add_argument(
-    '--optimize_eyeballpose',
-    default = True, # False for For RingNet project
-    type = bool,
-    help = 'If true optimize for the eyeball pose.'
-)
 
-parser.add_argument(
-    '--optimize_neckpose',
-    default = True, # False For RingNet project
-    type = bool,
-    help = 'If true optimize for the neck pose.'
-)
+def config_from_args(args: argparse.Namespace) -> FLAMEConfig:
+    """Build a :class:`FLAMEConfig` from parsed CLI arguments."""
+    return FLAMEConfig(
+        flame_model_path=args.flame_model_path,
+        static_landmark_embedding_path=args.static_landmark_embedding_path,
+        dynamic_landmark_embedding_path=args.dynamic_landmark_embedding_path,
+        shape_params=args.shape_params,
+        expression_params=args.expression_params,
+        pose_params=args.pose_params,
+        use_face_contour=args.use_face_contour,
+        use_3D_translation=args.use_3D_translation,
+        optimize_eyeballpose=args.optimize_eyeballpose,
+        optimize_neckpose=args.optimize_neckpose,
+        batch_size=args.batch_size,
+    )
 
-parser.add_argument(
-    '--num_worker',
-    type = int,
-    default = 4,
-    help = 'pytorch number worker.'
-)
 
-parser.add_argument(
-    '--batch_size',
-    type = int,
-    default = 8,
-    help = 'Training batch size.'
-)
+def get_config(argv: list[str] | None = None) -> FLAMEConfig:
+    """Backwards-compatible entry point: parse FLAME args and return a config.
 
-parser.add_argument(
-    '--ring_margin',
-    type = float,
-    default = 0.5,
-    help = 'ring margin.'
-)
-
-parser.add_argument(
-    '--ring_loss_weight',
-    type = float,
-    default = 1.0,
-    help = 'weight on ring loss.'
-)
-
-def get_config():
-    config = parser.parse_args()
-    return config
+    Provided so legacy scripts keep working; prefer building your own parser
+    with :func:`add_flame_args` and :func:`config_from_args`.
+    """
+    parser = argparse.ArgumentParser(description="FLAME model")
+    add_flame_args(parser)
+    return config_from_args(parser.parse_args(argv))

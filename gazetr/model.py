@@ -97,6 +97,14 @@ class Model(nn.Module):
 
         self.pos_embedding = nn.Embedding(dim_feature+1, maps)
 
+        # Token indices for the positional embedding. Registered as a
+        # non-persistent buffer so it moves with the model device and is
+        # not part of the saved state dict (the upstream checkpoint has no
+        # such key, so it must not be required by load_state_dict).
+        self.register_buffer(
+            "positions", torch.arange(0, dim_feature + 1), persistent=False
+        )
+
         self.feed = nn.Linear(maps, 2)
             
         self.loss_op = nn.L1Loss()
@@ -111,10 +119,7 @@ class Model(nn.Module):
         cls = self.cls_token.repeat( (1, batch_size, 1))
         feature = torch.cat([cls, feature], 0)
         
-        # 使用与feature相同的设备（支持CPU和CUDA）
-        position = torch.from_numpy(np.arange(0, 50)).to(feature.device)
-
-        pos_feature = self.pos_embedding(position)
+        pos_feature = self.pos_embedding(self.positions)
 
         # feature is [HW, batch, channel]
         feature = self.encoder(feature, pos_feature)
