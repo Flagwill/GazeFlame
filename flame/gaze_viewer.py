@@ -217,6 +217,8 @@ def estimate_eye_centers(
 # Scene construction
 # --------------------------------------------------------------------------
 GAZE_COLOR = (0.1, 0.3, 0.9, 1.0)
+SCLERA_COLOR = (0.95, 0.94, 0.92, 1.0)
+PUPIL_COLOR = (0.10, 0.09, 0.08, 1.0)
 
 
 def build_scene(
@@ -235,18 +237,38 @@ def build_scene(
     scene.add(pyrender.Mesh.from_trimesh(tri_mesh, smooth=True))
 
     gaze_len = face_scale * 0.6
-    sphere_radius = max(face_scale * 0.03, 0.006)
     line_radius = max(face_scale * 0.005, 0.0025)
     arrow_len = face_scale * 0.12
     cone_radius = line_radius * 3.0
 
+    # Anatomically-sized eyeballs: radius ~0.18x the inter-eye distance (slightly
+    # smaller than the eye opening so the white stays inside the lids). FLAME's
+    # eye joints sit deep in the sockets, so push the sclera center forward only
+    # ~0.2x its radius: enough to peek through the opening but well set back
+    # below the surrounding lid plane (no bulging dome).
+    eye_dist = float(np.linalg.norm(left_center - right_center))
+    sclera_radius = max(eye_dist * 0.18, 0.008)
+    pupil_radius = sclera_radius * 0.45
+    eye_forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    eye_offset = sclera_radius * 0.2
+
     for center in (left_center, right_center):
         end = center + gaze_dir * gaze_len
+        eye_center = center + eye_forward * eye_offset
 
-        sphere = trimesh.creation.uv_sphere(radius=sphere_radius)
-        sphere.apply_translation(center)
-        sphere.visual.vertex_colors = list(GAZE_COLOR)
-        scene.add(pyrender.Mesh.from_trimesh(sphere))
+        sclera = trimesh.creation.uv_sphere(radius=sclera_radius)
+        sclera.visual.vertex_colors = np.tile(
+            np.array(SCLERA_COLOR, dtype=np.float32), (sclera.vertices.shape[0], 1)
+        )
+        sclera.apply_translation(eye_center)
+        scene.add(pyrender.Mesh.from_trimesh(sclera))
+
+        pupil = trimesh.creation.uv_sphere(radius=pupil_radius)
+        pupil.visual.vertex_colors = np.tile(
+            np.array(PUPIL_COLOR, dtype=np.float32), (pupil.vertices.shape[0], 1)
+        )
+        pupil.apply_translation(eye_center + gaze_dir * sclera_radius)
+        scene.add(pyrender.Mesh.from_trimesh(pupil))
 
         line = make_cylinder_between(center, end, radius=line_radius, color=GAZE_COLOR)
         if line is not None:
@@ -339,32 +361,40 @@ def main() -> int:
         np.array([args.gaze_x, args.gaze_y, args.gaze_z], dtype=np.float32)
     )
 
-    eye_axis_angle = forward_to_axis_angle(target_gaze)
-    eye_pose_np = np.concatenate([eye_axis_angle, eye_axis_angle], axis=0).reshape(1, 6)
-    eye_pose = torch.tensor(eye_pose_np, dtype=torch.float32, device=device)
-
     neck_pose = (
         torch.zeros(1, 3, dtype=torch.float32, device=device)
         if config.optimize_neckpose
         else None
     )
 
+    # Neutral pass first: the eye joints do not move with the eye pose, so they
+    # locate the eyeballs regardless of the gaze direction.
+    _, landmarks, joints = flame(
+        shape_params,
+        expression_params,
+        pose_params,
+        neck_pose,
+        torch.zeros(1, 6, dtype=torch.float32, device=device),
+    )
+    left_center, right_center, face_scale = estimate_eye_centers(
+        landmarks[0].detach().cpu().numpy(), joints[0].detach().cpu().numpy()
+    )
+
+    # Keep the vector facing the camera for easier inspection in the default pose,
+    # and use that same (camera-facing) direction for both the eyeballs and arrow.
+    camera_pos = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    if not args.no_camera_flip and np.dot(target_gaze, (camera_pos - left_center)) < 0:
+        target_gaze = -target_gaze
+
+    eye_axis_angle = forward_to_axis_angle(target_gaze)
+    eye_pose_np = np.concatenate([eye_axis_angle, eye_axis_angle], axis=0).reshape(1, 6)
+    eye_pose = torch.tensor(eye_pose_np, dtype=torch.float32, device=device)
+
     vertices, landmarks, joints = flame(
         shape_params, expression_params, pose_params, neck_pose, eye_pose
     )
 
     vertices_np = vertices[0].detach().cpu().numpy()
-    landmarks_np = landmarks[0].detach().cpu().numpy()
-    joints_np = joints[0].detach().cpu().numpy()
-
-    left_center, right_center, face_scale = estimate_eye_centers(
-        landmarks_np, joints_np
-    )
-
-    # Keep the vector facing the camera for easier inspection in the default pose.
-    camera_pos = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    if not args.no_camera_flip and np.dot(target_gaze, (camera_pos - left_center)) < 0:
-        target_gaze = -target_gaze
 
     scene = build_scene(
         vertices_np, flame.faces, left_center, right_center, target_gaze, face_scale

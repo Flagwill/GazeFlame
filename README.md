@@ -14,24 +14,27 @@ Pitch / Yaw (弧度)
    │  run_gaze_to_flame.py                  坐标换算 (common/geometry.py)
    ▼
 3D 视线向量 (x, y, z)
-   │  FLAME (flame/gaze_viewer.py)          眼球关节驱动
-   ▼
-带视线箭头的 3D 头部 (pyrender)
+    │  common/flame_mirror.py + pyrender     FLAME 头部眼球驱动（离屏渲染）
+    ▼
+带视线箭头的 3D 头部 + 标注输入图（合成到同一个窗口）
 ```
+
 
 ## 目录结构
 
 ```
 GazeFlame/
-├── common/                  共享工具（几何换算等，流水线各阶段的唯一数据源）
+├── common/                  共享工具（几何换算 / 渲染 / 标注，流水线各阶段的唯一数据源）
 │   ├── geometry.py          pitch/yaw → 3D 视线向量等
 │   ├── face.py              人脸检测 + ETH-XGaze 归一化对齐 (dlib)
+│   ├── flame_mirror.py      FLAME 离屏渲染 + 单窗口合成 (compose_with_head)
+│   ├── viz.py               2D 视线标注 (draw_overlay, 摄像头/图片共用)
 │   ├── download_dlib_model.py 下载 dlib 68点模型 (需联网, 一次性)
 │   └── models/              dlib shape_predictor 模型 (gitignore)
 ├── environment.yml          conda 环境定义 (name: gaze_flame)
 ├── run.sh                   一键运行脚本（自动定位 conda 环境）
-├── run_gaze_to_flame.py     一键编排脚本 (GazeTR → FLAME)
-├── run_webcam.py            实时摄像头/视频流视线追踪 (+ 可选 FLAME 镜像)
+├── run_gaze_to_flame.py     一键编排脚本 (GazeTR → FLAME, 统一单窗口)
+├── run_webcam.py            实时摄像头/视频流视线追踪 (统一单窗口)
 ├── run_webcam.sh            摄像头一键脚本 (自动定位 conda 环境)
 ├── gazetr/                  原 GazeTR 项目
 │   ├── inference.py         推理入口 (含人脸对齐)
@@ -62,13 +65,17 @@ python -m common.download_dlib_model
 ### 1. 一键串联（GazeTR → FLAME）
 
 ```bash
-./run.sh                                  # 默认 CPU + 示例图片
+./run.sh                                  # 默认 CPU + 示例图片, 统一窗口显示
 ./run.sh --image /path/to/face.jpg        # 自定义图片
 DEVICE=cuda ./run.sh                      # 有 GPU 时走 cuda
-./run.sh --skip-viewer                    # 只算角度, 不启动 3D 窗口
-./run.sh --headless --save-image out.png  # 无窗口渲染到 PNG (适合自动化)
+./run.sh --skip-viewer                    # 只算角度, 不显示窗口
+./run.sh --headless --save-image out.png  # 无窗口, 把合成图存到 PNG (适合自动化)
 ./run.sh --no-align                       # 关闭人脸检测/对齐 (输入已是裁剪图时)
 ```
+
+统一窗口把**标注后的输入图**（视线箭头 + pitch/yaw 读数）和**跟随视线的 FLAME 头部**
+左右拼在同一个画面里（不再分别用控制台输出和独立的 pyrender 窗口）。
+默认弹出一个交互窗口（需 X11，按任意键关闭）；`--headless --save-image` 则直接存 PNG。
 
 默认会对任意照片做**人脸检测 + ETH-XGaze 归一化对齐**：dlib 检出最大人脸 →
 68 点关键点 → solvePnP 头部姿态 → 透视 warp 成 224×224 标准正面裁剪，
@@ -95,11 +102,11 @@ python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
 # --save-image out.png --headless   无窗口渲染 PNG
 ```
 
-### 4. 实时摄像头 / 视频流（GazeTR + 可选 FLAME 头部镜像）
+### 4. 实时摄像头 / 视频流（GazeTR + 可选 FLAME 头部，统一单窗口）
 
 ```bash
 ./run_webcam.sh                         # 打开摄像头 0, 实时显示视线箭头
-./run_webcam.sh --flame                 # 额外打开 FLAME 头部, 眼球跟随视线
+./run_webcam.sh --flame                 # 同一窗口右侧并排 FLAME 头部, 眼球跟随视线
 ./run_webcam.sh --video clip.mp4        # 也可以处理视频文件
 ./run_webcam.sh --camera 1 --no-mirror  # 指定摄像头 / 关闭自拍镜像
 DEVICE=cuda ./run_webcam.sh             # 有 GPU 时用 cuda
@@ -109,7 +116,8 @@ DEVICE=cuda ./run_webcam.sh             # 有 GPU 时用 cuda
 
 交互控制：`q`/`ESC` 退出，`s` 保存快照。逐帧执行 人脸检测(降采样, ~30ms) →
 ETH-XGaze 对齐 → GazeTR 推理（CPU 下本机实测约 **10fps**，受摄像头帧率上限约束）；
-FLAME 头部为离屏渲染，按 `--head-fps`（默认 8）节流刷新，不拖慢主画面。
+加 `--flame` 后 FLAME 头部离屏渲染并按 `--head-fps`（默认 8）节流刷新，
+与标注后的画面合成到**同一个** `GazeFlame` 窗口，不拖慢主画面。
 
 ## 性能说明
 
@@ -122,9 +130,13 @@ FLAME 头部为离屏渲染，按 `--head-fps`（默认 8）节流刷新，不�
 
 - 两个项目顶层有 `model`、`config.py`、`README.md` 等重名文件，
   因此用 `gazetr/` 与 `flame/` 子目录隔离，避免冲突。
-- 子进程 cwd 分别为 `gazetr/`、`flame/`，脚本内 import 依赖该目录结构；
-  `run_gaze_to_flame.py` 通过 JSON 临时文件在阶段间传递结果。
-- 视线几何换算集中在 `common/geometry.py`，避免在多处重复定义。
+- `run_gaze_to_flame.py` 仍把 GazeTR 推理作为子进程（cwd=`gazetr/`），通过 JSON
+  临时文件传递 pitch/yaw；FLAME 头部改为**进程内离屏渲染**（`common/flame_mirror`），
+  以便与标注画面合成到同一窗口。
+- 统一可视化的公共件：`common/geometry.py`（几何换算）、`common/viz.py`（2D 标注
+  `draw_overlay`）、`common/flame_mirror.py`（`FlameMirror` 离屏渲染 + `compose_with_head`
+  单窗口合成），两条流水线（图片 / 摄像头）共用，避免重复实现。
+- `flame/gaze_viewer.py` 保留为独立调试入口（手动给方向、单看 3D 头部），流水线不再依赖它。
 
 ## 原始项目
 

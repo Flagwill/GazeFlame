@@ -1,9 +1,9 @@
 """Real-time gaze tracking from a webcam or video file, optionally driving FLAME.
 
-Interactive mode opens two windows:
-  - ``GazeTR``: the live camera feed with face box, 6 landmarks and a gaze arrow
-  - ``FLAME`` : a 3D FLAME head whose eyeballs follow the gaze in real time
-    (rendered offscreen, so it also works without a GLFW-capable viewer)
+Interactive mode opens a single window showing the live camera feed with face
+box / landmarks / gaze arrow, and (with ``--flame``) a side-by-side FLAME head
+whose eyeballs follow the gaze in real time.  The FLAME panel is rendered
+offscreen, so it also works without a GLFW-capable viewer.
 
 Controls: ``q`` / ``ESC`` quit, ``s`` save a snapshot of the camera feed.
 
@@ -14,17 +14,16 @@ Examples:
     python run_webcam.py --camera 0 --headless --save-frames out/  # automation
 
 Notes:
-  - dlib face detection is run on a downscaled frame internally (common.face),
-    so a 640x480 webcam costs ~30ms/frame instead of ~450ms.
-  - The FLAME head is rendered in the main loop at a capped rate
-    (``--head-fps``); pyrender's OpenGL context is bound to the creating
-    thread, so it cannot live on a separate thread.
+    - dlib face detection is run on a downscaled frame internally (common.face),
+      so a 640x480 webcam costs ~30ms/frame instead of ~450ms.
+    - The FLAME head is rendered in the main loop at a capped rate
+      (``--head-fps``); pyrender's OpenGL context is bound to the creating
+      thread, so it cannot live on a separate thread.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -35,11 +34,9 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parent
 GAZETR_ROOT = REPO_ROOT / "gazetr"
-FLAME_ROOT = REPO_ROOT / "flame"
 
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(GAZETR_ROOT))
-sys.path.insert(0, str(FLAME_ROOT))
 
 # GazeTR (gazetr/model.py)
 import model  # noqa: E402
@@ -47,7 +44,9 @@ import model  # noqa: E402
 # inference.predict_gaze (gazetr/inference.py, pulls in common.face)
 from inference import predict_gaze  # noqa: E402
 
+from common.flame_mirror import FlameMirror, compose_with_head  # noqa: E402
 from common.geometry import pitch_yaw_to_gaze  # noqa: E402
+from common.viz import draw_overlay  # noqa: E402
 
 DEFAULT_MODEL = str(GAZETR_ROOT / "model" / "GazeTR-H-ETH.pt")
 
@@ -63,133 +62,11 @@ def load_gazetr_model(model_path: str, device):
 
 
 # ---------------------------------------------------------------------------
-# Camera-feed overlay
-# ---------------------------------------------------------------------------
-def draw_overlay(
-    frame: np.ndarray,
-    pitch: float,
-    yaw: float,
-    info: dict | None,
-    mirror: bool = False,
-) -> np.ndarray:
-    """Draw face box, landmarks and a gaze arrow on a copy of ``frame``."""
-    out = frame.copy()
-
-    if info:
-        l, t, r, b = info["rect"]
-        cv2.rectangle(out, (l, t), (r, b), (0, 255, 0), 2)
-        for (x, y) in info["landmarks6"].astype(int):
-            cv2.circle(out, (x, y), 3, (0, 220, 0), -1)
-
-    h, w = out.shape[:2]
-    length = min(w, h) * 0.35
-    dx = -length * np.sin(yaw) * np.cos(pitch)
-    dy = -length * np.sin(pitch)
-    if mirror:  # selfie view: mirror the horizontal component too
-        dx = -dx
-    center = (w // 2, h // 2)
-    end = (int(center[0] + dx), int(center[1] + dy))
-    cv2.arrowedLine(out, center, end, (0, 0, 255), 3, cv2.LINE_AA, tipLength=0.25)
-    cv2.putText(
-        out,
-        f"pitch {np.degrees(pitch):+6.1f} deg  yaw {np.degrees(yaw):+6.1f} deg",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2,
-    )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# FLAME mirror (offscreen renderer, created + used on the main thread)
-# ---------------------------------------------------------------------------
-class FlameMirror:
-    """Reusable FLAME head whose eyeballs track a live gaze direction."""
-
-    def __init__(self, device="cpu", width: int = 320, height: int = 320):
-        # Imported lazily so --flame off costs nothing extra.
-        import pyrender
-
-        import gaze_viewer
-        from config import FLAMEConfig
-        from FLAME import FLAME
-
-        self._gv = gaze_viewer
-        self.width = width
-        self.height = height
-
-        config = FLAMEConfig()
-        config.batch_size = 1
-        # FLAMEConfig 默认路径相对 flame/, 转成绝对路径以免依赖 cwd。
-        config.flame_model_path = str(FLAME_ROOT / config.flame_model_path)
-        config.static_landmark_embedding_path = str(
-            FLAME_ROOT / config.static_landmark_embedding_path
-        )
-        config.dynamic_landmark_embedding_path = str(
-            FLAME_ROOT / config.dynamic_landmark_embedding_path
-        )
-
-        self.device = torch.device(device)
-        self.flame = FLAME(config).to(self.device)
-        self.shape = torch.zeros(
-            1, config.shape_params, dtype=torch.float32, device=self.device
-        )
-        self.expression = torch.zeros(
-            1, config.expression_params, dtype=torch.float32, device=self.device
-        )
-        self.pose = torch.zeros(
-            1, config.pose_params, dtype=torch.float32, device=self.device
-        )
-        self.neck_pose = (
-            torch.zeros(1, 3, dtype=torch.float32, device=self.device)
-            if config.optimize_neckpose
-            else None
-        )
-        self._camera_pos = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        self._renderer = pyrender.OffscreenRenderer(width, height)
-
-    def render(self, gaze: np.ndarray) -> np.ndarray:
-        """Render the head looking along ``gaze``; returns an RGB image."""
-        gv = self._gv
-        target_gaze = gv.normalize(np.asarray(gaze, dtype=np.float32))
-
-        eye_axis_angle = gv.forward_to_axis_angle(target_gaze)
-        eye_pose_np = np.concatenate(
-            [eye_axis_angle, eye_axis_angle], axis=0
-        ).reshape(1, 6)
-        eye_pose = torch.tensor(eye_pose_np, dtype=torch.float32, device=self.device)
-
-        with torch.no_grad():
-            vertices, landmarks, joints = self.flame(
-                self.shape, self.expression, self.pose, self.neck_pose, eye_pose
-            )
-
-        vertices_np = vertices[0].detach().cpu().numpy()
-        landmarks_np = landmarks[0].detach().cpu().numpy()
-        joints_np = joints[0].detach().cpu().numpy()
-
-        left_center, right_center, face_scale = gv.estimate_eye_centers(
-            landmarks_np, joints_np
-        )
-        if np.dot(target_gaze, (self._camera_pos - left_center)) < 0:
-            target_gaze = -target_gaze
-
-        scene = gv.build_scene(
-            vertices_np, self.flame.faces, left_center, right_center,
-            target_gaze, face_scale,
-        )
-        color, _ = self._renderer.render(scene)
-        return color
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Real-time webcam/video gaze tracking (+ optional FLAME mirror)",
+        description="Real-time webcam/video gaze tracking (single unified window)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     src = parser.add_mutually_exclusive_group()
@@ -199,28 +76,28 @@ def build_parser() -> argparse.ArgumentParser:
                      help="play a video file instead of the webcam")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="GazeTR model path")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
-                        help="inference device (auto = cuda if available)")
+                       help="inference device (auto = cuda if available)")
     parser.add_argument("--no-align", dest="align", action="store_false",
                         default=True, help="disable face detection/alignment")
     parser.add_argument("--mirror", dest="mirror", default=None, action="store_true",
-                        help="mirror the camera feed (selfie view)")
+                       help="mirror the camera feed (selfie view)")
     parser.add_argument("--no-mirror", dest="mirror", action="store_false",
-                        help="do not mirror the camera feed")
+                       help="do not mirror the camera feed")
     parser.add_argument("--width", type=int, default=640, help="capture width")
     parser.add_argument("--height", type=int, default=480, help="capture height")
     parser.add_argument("--flame", action="store_true",
-                        help="open a second window with a FLAME head tracking the gaze")
+                        help="show a FLAME head panel in the window tracking the gaze")
     parser.add_argument("--head-size", type=int, default=640,
-                        help="FLAME window edge length (default: 640; render "
-                             "cost barely grows with size, only the mesh/scene "
-                             "build dominates)")
+                       help="FLAME panel edge length (default: 640; render "
+                          "cost barely grows with size, only the mesh/scene "
+                          "build dominates)")
     parser.add_argument("--head-fps", type=float, default=8.0,
                         help="max FLAME head refresh rate (default: 8)")
     parser.add_argument("--headless", action="store_true",
-                        help="no windows; process frames and (optionally) save them")
+                        help="no window; process frames and (optionally) save them")
     parser.add_argument("--save-frames", type=str, default=None,
                         help="save annotated camera frames (and FLAME head renders) "
-                             "to this directory")
+                           "to this directory")
     parser.add_argument("--max-frames", type=int, default=0,
                         help="stop after this many frames (0 = unlimited)")
     return parser
@@ -268,6 +145,7 @@ def main() -> int:
     fps_frames, fps_t0 = 0, time.time()
     last_head_time = 0.0
     last_gaze: np.ndarray | None = None
+    head_img: np.ndarray | None = None
     read_failures = 0
     head_dir = Path(args.save_frames) / "head" if args.save_frames and mirror else None
     if head_dir:
@@ -311,8 +189,6 @@ def main() -> int:
                         cv2.imwrite(
                             str(head_dir / f"frame_{frame_idx:05d}.png"), head_img
                         )
-                    elif not args.headless:
-                        cv2.imshow("FLAME Gaze", head_img)
 
             if args.save_frames:
                 out_dir = Path(args.save_frames)
@@ -320,7 +196,8 @@ def main() -> int:
                 cv2.imwrite(str(out_dir / f"frame_{frame_idx:05d}.png"), annotated)
 
             if not args.headless:
-                cv2.imshow("GazeTR Webcam", annotated)
+                composed = compose_with_head(annotated, head_img)
+                cv2.imshow("GazeFlame", composed)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break
