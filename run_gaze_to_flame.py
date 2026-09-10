@@ -2,11 +2,13 @@
 
 Orchestrates the two stages of the GazeFlame pipeline:
 
-1. Run ``gazetr/inference.py`` as a subprocess on a single image (or folder),
-   keeping the two sub-projects' own import layouts intact.
-2. Read pitch/yaw from a temporary JSON result file.
-3. Convert pitch/yaw to a normalized 3D gaze vector (``common.geometry``).
-4. Render the FLAME head toward that vector (``common.flame_mirror``) and show
+1. Load GazeTR and run it IN-PROCESS on a single image (or folder) — same
+   sys.path pattern as ``run_webcam.py`` (``gazetr/`` on ``sys.path``), which
+   saves a second interpreter startup + a second torch/dlib import (~2s).
+   ``--subprocess`` keeps the legacy path (``gazetr/inference.py`` child
+   process + JSON temp file) as a fallback.
+2. Convert pitch/yaw to a normalized 3D gaze vector (``common.geometry``).
+3. Render the FLAME head toward that vector (``common.flame_mirror``) and show
    it side-by-side with the annotated input image in ONE cv2 window.
 
 By default the unified window is shown interactively (needs an X11 display).
@@ -24,7 +26,13 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+
+from common.gpu import flame_render_device, prepare_amd_gpu_env, resolve_device
+
+# 必须早于任何 import torch (ROCm: HSA 覆盖 + 抢注系统 libdrm)。
+prepare_amd_gpu_env()
 
 import cv2
 
@@ -42,6 +50,45 @@ def run_python(args: list[str], cwd: Path) -> None:
     completed = subprocess.run([sys.executable, *args], cwd=str(cwd), check=False)
     if completed.returncode != 0:
         raise SystemExit(completed.returncode)
+
+
+def run_gaze_inprocess(
+    gazetr_root: Path,
+    model_path: Path,
+    image_path: Path,
+    image_folder: Path | None,
+    align: bool,
+    align_out: str | None,
+    device: str,
+    result_file: Path,
+) -> None:
+    """Load GazeTR in this interpreter and write the JSON result file.
+
+    Mirrors the subprocess call (same ``inference()`` code path) but avoids a
+    second interpreter startup + torch/dlib import (~2 s on this machine).
+    """
+    t0 = time.perf_counter()
+    sys.path.insert(0, str(gazetr_root))
+    import torch
+
+    import model as gazetr_model  # gazetr/model.py (before flame/ joins sys.path)
+    from inference import collect_image_paths, inference as gaze_inference
+
+    print(f"\n[GazeTR→FLAME] 进程内推理 (device: {device})")
+    net = gazetr_model.Model()
+    net.load_state_dict(
+        torch.load(str(model_path), map_location=device, weights_only=True)
+    )
+    net.to(device)
+    image_paths = collect_image_paths(
+        str(image_path) if not image_folder else None,
+        str(image_folder) if image_folder else None,
+    )
+    gaze_inference(
+        net, image_paths, device=device, output_file=str(result_file), align=align,
+        align_out=align_out,
+    )
+    print(f"[GazeTR→FLAME] GazeTR 阶段耗时 {time.perf_counter() - t0:.2f}s")
 
 
 def read_gaze_result(result_file: Path) -> dict:
@@ -72,8 +119,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", default=str(DEFAULT_IMAGE), help="Input image path")
     parser.add_argument("--image_folder", default=None,
                         help="Input image folder (alternative to --image)")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
-                        help="Inference device (auto-falls back to cpu)")
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "cuda", "cpu", "gpu", "rocm"],
+                        help="Inference device; auto = GPU (ROCm/CUDA) if usable "
+                             "(falls back to cpu). gpu/rocm are cuda aliases")
+    parser.add_argument("--subprocess", action="store_true",
+                        help="Legacy mode: run gazetr/inference.py in a child "
+                             "process instead of in-process")
     parser.add_argument("--skip-viewer", action="store_true",
                         help="Only run GazeTR and print pitch/yaw/gaze; "
                              "do not show the unified window")
@@ -131,25 +183,45 @@ def main() -> None:
         raise SystemExit("--headless 需要配合 --save-image <path>")
     save_image = Path(args.save_image).resolve() if args.save_image else None
 
+    t_pipeline = time.perf_counter()
+    device = resolve_device(args.device)
+    if device == "cuda":
+        import torch
+
+        hip = getattr(torch.version, "hip", None)
+        backend = f"ROCm {hip}" if hip else "CUDA"
+        print(f"推理设备: cuda ({backend}, {torch.cuda.get_device_name(0)})")
+    else:
+        print("推理设备: cpu")
+
     with tempfile.TemporaryDirectory(prefix="gazetr_") as temp_dir:
         result_file = Path(temp_dir) / "results.json"
 
-        inference_args = [
-            str(gazetr_root / "inference.py"),
-            "--model", str(model_path),
-        ]
-        if image_folder:
-            inference_args += ["--image_folder", str(image_folder)]
+        if args.subprocess:
+            inference_args = [
+                str(gazetr_root / "inference.py"),
+                "--model", str(model_path),
+            ]
+            if image_folder:
+                inference_args += ["--image_folder", str(image_folder)]
+            else:
+                if not image_path.exists():
+                    raise FileNotFoundError(f"图片不存在: {image_path}")
+                inference_args += ["--image", str(image_path)]
+            inference_args += ["--output", str(result_file), "--device", device]
+            if args.no_align:
+                inference_args += ["--no-align"]
+            if args.align_out:
+                inference_args += ["--align-out", str(Path(args.align_out).resolve())]
+            run_python(inference_args, cwd=gazetr_root)
         else:
-            if not image_path.exists():
+            if not image_folder and not image_path.exists():
                 raise FileNotFoundError(f"图片不存在: {image_path}")
-            inference_args += ["--image", str(image_path)]
-        inference_args += ["--output", str(result_file), "--device", args.device]
-        if args.no_align:
-            inference_args += ["--no-align"]
-        if args.align_out:
-            inference_args += ["--align-out", str(Path(args.align_out).resolve())]
-        run_python(inference_args, cwd=gazetr_root)
+            run_gaze_inprocess(
+                gazetr_root, model_path, image_path, image_folder,
+                align=not args.no_align, align_out=args.align_out,
+                device=device, result_file=result_file,
+            )
 
         result = read_gaze_result(result_file)
         pitch, yaw = result["pitch"], result["yaw"]
@@ -163,13 +235,14 @@ def main() -> None:
         )
 
         if args.skip_viewer:
+            print(f"[GazeTR→FLAME] 总耗时 {time.perf_counter() - t_pipeline:.2f}s")
             return
 
         # 统一窗口：左侧标注输入图 + 右侧 FLAME 头部，二者合成到同一画面。
+        t_flame = time.perf_counter()
         from common.flame_mirror import FlameMirror
         from common.viz import draw_overlay
 
-        device = resolve_device(args.device)
         source_image = Path(result["image"]).resolve() if result["image"] else image_path
         bgr = cv2.imread(str(source_image))
         if bgr is None:
@@ -177,23 +250,11 @@ def main() -> None:
         panel = scale_to_width(bgr, args.display_width // 2)
         annotated = draw_overlay(panel, pitch, yaw, info=None, show_face=False)
 
-        mirror = FlameMirror(str(device), args.head_size, args.head_size)
+        mirror = FlameMirror(flame_render_device(device), args.head_size, args.head_size)
         head_img = mirror.render(gaze)
+        print(f"[GazeTR→FLAME] FLAME 渲染阶段耗时 {time.perf_counter() - t_flame:.2f}s")
         show_or_save(annotated, head_img, save_image, args.headless)
-
-
-def resolve_device(device: str) -> str:
-    """Map ``cuda``→``cpu`` when no GPU is present; return a torch device str."""
-    if device == "cuda":
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                print("警告: CUDA不可用，切换到CPU模式")
-                return "cpu"
-        except Exception:  # pragma: no cover - torch always present here
-            return "cpu"
-    return device
+        print(f"[GazeTR→FLAME] 总耗时 {time.perf_counter() - t_pipeline:.2f}s")
 
 
 def scale_to_width(img, max_w: int):

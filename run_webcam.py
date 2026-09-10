@@ -28,15 +28,25 @@ import sys
 import time
 from pathlib import Path
 
-import cv2
-import numpy as np
-import torch
-
 REPO_ROOT = Path(__file__).resolve().parent
 GAZETR_ROOT = REPO_ROOT / "gazetr"
 
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(GAZETR_ROOT))
+
+# 必须早于 import torch (ROCm: HSA 覆盖 + 抢注系统 libdrm; CPU/CUDA build 无副作用)。
+from common.gpu import (  # noqa: E402
+    flame_realtime_device,
+    flame_render_device,
+    prepare_amd_gpu_env,
+    rocm_igpu_guard,
+)
+
+prepare_amd_gpu_env()
+
+import cv2
+import numpy as np
+import torch
 
 # GazeTR (gazetr/model.py)
 import model  # noqa: E402
@@ -51,13 +61,22 @@ from common.viz import draw_overlay  # noqa: E402
 DEFAULT_MODEL = str(GAZETR_ROOT / "model" / "GazeTR-H-ETH.pt")
 
 
-def load_gazetr_model(model_path: str, device):
+def load_gazetr_model(model_path: str, device, warmup: bool = True):
     """Load the pretrained GazeTR model and put it in eval mode."""
     net = model.Model()
     state_dict = torch.load(model_path, map_location=device, weights_only=True)
     net.load_state_dict(state_dict)
     net.to(device)
     net.eval()
+    if warmup:
+        # 预热: 吸收 GPU 首次 kernel/内存池 与 CPU 首次调度的固定开销,
+        # 避免实时流水线第一帧明显变慢。
+        dummy = torch.zeros(1, 3, 224, 224, device=device)
+        with torch.no_grad():
+            for _ in range(3):
+                net({"face": dummy})
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     return net
 
 
@@ -75,8 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--video", type=str, default=None,
                      help="play a video file instead of the webcam")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="GazeTR model path")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
-                       help="inference device (auto = cuda if available)")
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "cpu", "cuda", "gpu", "rocm"],
+                        help="inference device (auto = GPU if usable, else cpu; "
+                             "ROCm/AMD GPUs also use 'cuda')")
     parser.add_argument("--no-align", dest="align", action="store_false",
                         default=True, help="disable face detection/alignment")
     parser.add_argument("--mirror", dest="mirror", default=None, action="store_true",
@@ -87,10 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, default=480, help="capture height")
     parser.add_argument("--flame", action="store_true",
                         help="show a FLAME head panel in the window tracking the gaze")
-    parser.add_argument("--head-size", type=int, default=640,
-                       help="FLAME panel edge length (default: 640; render "
-                          "cost barely grows with size, only the mesh/scene "
-                          "build dominates)")
+    parser.add_argument("--head-size", type=int, default=480,
+                       help="FLAME panel edge length (default: 480 = camera "
+                          "height, so compose() shows it 1:1; GL readback "
+                          "cost grows with area)")
     parser.add_argument("--head-fps", type=float, default=8.0,
                         help="max FLAME head refresh rate (default: 8)")
     parser.add_argument("--headless", action="store_true",
@@ -106,10 +127,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    # FLAME 面板开启时，ROCm 核显会因 GL+HIP 共载挂死 → 自动回退 cpu（见 gpu.py）。
+    device = torch.device(flame_realtime_device(args.device, args.flame))
     print("Using device:", device)
 
     if args.video:
@@ -130,13 +149,16 @@ def main() -> int:
     if args.video is None:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        # V4L2 默认缓存多帧; 流水线耗时>采集周期时这会让我们一直处理/显示
+        # 过期画面, 压到 1 以降低延迟 (不支持的驱动上是无害的空操作)。
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     mirror: FlameMirror | None = None
     if args.flame:
         if args.headless and not args.save_frames:
             print("提示: --headless 且未指定 --save-frames 时跳过 FLAME 渲染")
         else:
-            mirror = FlameMirror(str(device), args.head_size, args.head_size)
+            mirror = FlameMirror(flame_render_device(str(device)), args.head_size, args.head_size)
 
     print(f"处理 {source_desc} (按 q/ESC 退出, s 保存快照)")
     print("-" * 60)
@@ -144,6 +166,7 @@ def main() -> int:
     frame_idx = 0
     fps_frames, fps_t0 = 0, time.time()
     last_head_time = 0.0
+    last_fwd_end = time.perf_counter()
     last_gaze: np.ndarray | None = None
     head_img: np.ndarray | None = None
     read_failures = 0
@@ -173,6 +196,11 @@ def main() -> int:
             pitch, yaw, face_count, _prep, info = predict_gaze(
                 net, frame, str(device), align=args.align
             )
+            # gfx1035 核显占空比护栏: 距上一次 forward 结束的间隔补足 100ms。
+            # 真实摄像头 (~10fps 天然满足) 无操作; --video 快速回放会被限速,
+            # 避免背靠背满载触发 GPU Hang (见 common/gpu.py)。
+            rocm_igpu_guard(device, time.perf_counter() - last_fwd_end)
+            last_fwd_end = time.perf_counter()
             frame_idx += 1
 
             annotated = draw_overlay(frame, pitch, yaw, info, mirror=args.mirror)

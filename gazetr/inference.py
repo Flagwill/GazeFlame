@@ -30,14 +30,20 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
+
+# 让 gazetr/inference.py 也能以 cwd=gazetr 独立运行时导入顶层 common 包。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# 必须早于 import torch (ROCm: HSA 覆盖 + 抢注系统 libdrm; CPU/CUDA build 无副作用)。
+from common.gpu import prepare_amd_gpu_env, resolve_device, rocm_igpu_guard  # noqa: E402
+
+prepare_amd_gpu_env()
 
 import cv2
 import numpy as np
 import torch
-
-# 让 gazetr/inference.py 也能以 cwd=gazetr 独立运行时导入顶层 common 包。
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import model
 from common.face import align_face_to_gaze_crop, draw_aligned_overlay
@@ -323,6 +329,7 @@ def inference(
     with torch.no_grad():
         processed = 0
         for start in range(0, len(image_paths), batch_size):
+            batch_t0 = time.perf_counter()
             batch = image_paths[start : start + batch_size]
             loaded = []
             for image_path in batch:
@@ -343,6 +350,9 @@ def inference(
                 dim=0,
             )
             gaze_pred = net({"face": inputs}).cpu().numpy()
+            # gfx1035 核显护栏: 大批量文件夹背靠背 forward 会 GPU Hang,
+            # 把相邻批间隔补足到安全占空比 (CPU/CUDA/独显不受影响, 见 common/gpu.py)。
+            rocm_igpu_guard(device, time.perf_counter() - batch_t0)
 
             for (image_path, bgr, (_, face_count)), gaze in zip(prepared, gaze_pred):
                 processed += 1
@@ -476,8 +486,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="把对齐后的 224x224 人脸裁剪图(带关键点)保存到该目录, 便于调试",
     )
     parser.add_argument(
-        "--device", "-d", type=str, default="cuda", choices=["cuda", "cpu"],
-        help="使用的设备 (默认: cuda; 无 GPU 时自动回退 cpu)",
+        "--device", "-d", type=str, default="auto",
+        choices=["auto", "cuda", "cpu", "gpu", "rocm"],
+        help="使用的设备 (默认 auto: 探测到可用 GPU 用 cuda, 否则 cpu; "
+             "ROCm/AMD GPU 同样走 cuda 名称)",
     )
     return parser
 
@@ -485,9 +497,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("警告: CUDA不可用，切换到CPU模式")
-        args.device = "cpu"
+    args.device = resolve_device(args.device)
+    if args.device == "cuda":
+        import torch as _t
+        if getattr(_t.version, "hip", None):
+            print(f"使用 ROCm GPU: {_t.cuda.get_device_name(0)}")
     device = torch.device(args.device)
 
     print("=" * 70)

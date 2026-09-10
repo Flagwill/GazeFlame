@@ -16,6 +16,16 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+# ROCm 版 torch: 须在 import torch 前设 HSA 覆盖并抢注系统 libdrm, 否则
+# 非官方芯片 kernel 报错、pyrender 的 GLX 上下文也会挂 (common/gpu.py)。
+# 以 cwd=flame 独立运行, 所以手动把仓库根加进 sys.path。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common.gpu import prepare_amd_gpu_env, resolve_device  # noqa: E402
+
+prepare_amd_gpu_env()
 
 import numpy as np
 import pyrender
@@ -344,9 +354,9 @@ def main() -> int:
     config.batch_size = 1
 
     if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(resolve_device("auto"))
     else:
-        device = torch.device(args.device)
+        device = torch.device(resolve_device(args.device))
     print("Using device:", device)
 
     flame = FLAME(config).to(device)

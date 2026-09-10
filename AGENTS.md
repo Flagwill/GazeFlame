@@ -69,9 +69,16 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
   inference.py 默认弹 tkinter 窗口阻塞，已改为 --popup 显式启用）
 - `pyrender.Viewer` 需要 **X11 显示环境**（弹出 GLFW 窗口，阻塞至手动关闭）；
   无 X11/后台会话中会静默退出 → 自动化请用 `--headless --save-image`
-- 实时 webcam 已实测（2026-09-09）：本机 `/dev/video0` 存在、`DISPLAY=:1` 可用；
-  摄像头读取 ~100ms/帧（首次 ~700ms 预热，分辨率无关，上限 ~10fps），
-  单帧流水线（降采样检测 25ms + 对齐 + GazeTR 16ms）约 **10fps**
+- 实时 webcam 已实测（2026-09-09 建，2026-09-10 夜修订）：本机 `/dev/video0`
+  存在、`DISPLAY=:1` 可用；**裸摄像头读取 30fps（~33ms/帧，非旧测的 ~100ms），
+  旧"上限 ~10fps"作废**——当时 10fps 的真凶是 FLAME 渲染：每帧重建整个 pyrender
+  场景（build_scene ~44ms + gl_render ~85ms，其中 ~28ms 是无人使用的深度回读），
+  8Hz 更新时每次阻塞主循环 ~140ms。修复后 `--flame` 实测 ~14.5–15fps（30s 连续，
+  含 face=1 渲染段，无尖峰）：FlameMirror 场景只建一次、render 仅对两个
+  gaze-root 节点 set_pose（480² 下 140ms→**5.4ms**，与旧实现逐像素比对差
+  0.02%，仅在眼球边缘），并跳过深度缓冲 glReadPixels。剩余下限：dlib
+  HOG@384 ~34ms + torch CPU 前向 12ms（默认 8 线程实测最优，勿减）+ GUI ~10ms
+  ≈ 理论 20fps
 - dlib HOG 检测开销随面积增长：640x480 全图检测 ~458ms，降采样到 384 后仅 ~25ms
   （`common/face.py` 的 `DETECT_MAX_DIM=384` 已自动处理大图，勿改大）
 - pyrender 离屏渲染的 OpenGL 上下文**绑定创建它的线程**，不能跨线程渲染
@@ -82,22 +89,79 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
   `run_webcam.py --flame --headless --save-frames` 逐帧存标注图 + head/ 节流帧，均正常。
   注意：pyrender **OffscreenRenderer 仍需可用 GL 上下文**（本机 `DISPLAY=:1`）；
   `DISPLAY=`（空）会让其创建失败并报 Pyglet NoSuchDisplayException——这不是代码问题。
+- **AMD GPU (ROCm) 已启用（2026-09-10 重启后复测，带占空比护栏）**：
+  本机 Radeon 680M = gfx1035，装 torch 2.4.1+rocm6.1（cp38 wheel，官方索引或
+  上交镜像 mirror.sjtu.edu.cn/pytorch-wheels/rocm6.1/），需
+  `HSA_OVERRIDE_GFX_VERSION=10.3.0`（common/gpu.py 自动设）。前向 batch=1 约
+  5ms、batch=16 约 35ms。**坑（关键）**：核显与显示共享内存，**背靠背满载**
+  forward 到 ~300 次(b1)/60-120 次(b16) 必现 GPU Hang + amdgpu MODE2 reset
+  （`HSA_ENABLE_SDMA=0`、禁用 fused SDPA 均无效；挂死后重启才恢复）。
+  **对策 = 占空比护栏** `common/gpu.py:rocm_igpu_guard(device, elapsed)`：把相邻
+  两次 GPU forward 的间隔补足到 `ROCM_SAFE_INTERVAL`(100ms)。实测该间隔下
+  满载 120×16 批、3000 帧 duty、600 帧 webcam 全流水线均零故障。真实摄像头
+  天然 ~10fps（间隔>100ms）时护栏为 no-op，不损实时性；快速视频回放 / 大批量
+  文件夹会被限速到 ~10fps 以保安全。已接入 `run_webcam.py` 主循环与
+  `gazetr/inference.py` 批循环。稳定 AMD 独显可 `GAZE_ROCM_SAFE_MODE=0` 关闭。
+  单张图 run.sh 仍默认 cpu（GPU 上下文初始化多花 ~1.5s，单图不划算；
+  DEVICE=cuda 显式开启则走 GPU）。
+  **第二个坑（2026-09-10 夜修复）：HIP 与持续 OpenGL 渲染互斥**。`run_webcam
+  --flame` 有人脸时 pyrender 每帧做 GL 渲染（光栅化在同一块核显的 3D 引擎上），
+  护栏留出的"空闲"被 GL 占满 → 与 HIP 共载，实测 21–55s（55–300 帧）必现
+  Memory access fault，与 FLAME 形变放哪无关、`LIBGL_ALWAYS_SOFTWARE=1` 也救不了。
+  **对策 = `common/gpu.py:flame_realtime_device(requested, flame_enabled)`**：
+  ROCm 构建 + `--flame` 时推理自动回退 cpu（GazeTR CPU 前向 12ms 本就满足
+  10fps，GPU 在此场景无收益；GL 回到纯图形使用的稳定老路），打印提示可懂；
+  无 --flame 的实时/批量仍走 GPU+护栏。已验证修复后 1500 帧/155s 连续 FLAME
+  渲染零故障。另外 `flame_render_device()` 在强制用 GPU 跑 FLAME 时把形变挪回
+  cpu（纵深防御）。挂死过 1–2 次后 GPU 可能进入"无 fault 的静默 NaN 劣化态"
+  （fix 前的 NaN 即此），再跑几分钟/复位后会恢复——遇到莫名 NaN 先怀疑这个。
+- **推理提速（2026-09-10，CPU 实测）**：`run_gaze_to_flame.py` 默认改为**进程内**
+  加载 GazeTR（同 run_webcam 的 sys.path 模式，先 `import model` 再让
+  flame_mirror 把 flame/ 加进 sys.path，避免与 `flame/model/` 数据目录撞名）。
+  `--skip-viewer` 纯推理路径 3.40s → **2.06s**（省一次解释器启动 + torch/dlib
+  二次导入）。旧子进程+JSON 临时文件链路保留为 `--subprocess` 回退选项。
+  run_webcam 增加 load 后 3 次 dummy forward 预热（GPU 首帧 455ms→24ms 级别；
+  CPU 首帧亦稳定）。当前分段耗时：GazeTR 阶段 ~1.8s（torch import 1.0s +
+  dlib 模型 0.65s + 其余），FLAME 阶段 ~1.0s；模型前向本身仅 13ms（300 帧
+  持续压测 median 13.0 / max 15.1ms，无劣化）。
 
 ## Agent 注意事项
 
-- 本机无 GPU：所有 torch 推理加 `--device cpu`
+- 本机 GPU：Radeon 680M 核显（gfx1035，torch 已装 2.4.1+rocm6.1，`cuda` 即 ROCm）。
+  可安全用于实时/批量推理，**但必须保留 `rocm_igpu_guard` 占空比护栏**（背靠背
+  满载会 GPU Hang，见上文）；**`--flame` 实时模式必须经 `flame_realtime_device`
+  回退 cpu**（HIP 与持续 GL 渲染共载必挂）；单张图 run.sh 默认仍 cpu（GPU 初始化不划算）
 - 交互式窗口（`run_gaze_to_flame` 的 cv2 窗口 / `run_webcam` / `gaze_viewer` 的
   pyrender.Viewer）都是阻塞式 GUI：自动化验证请用 `--headless --save-image`（或
   `--save-frames`），可正常退出（退出码 0）；`--headless` 需配合保存路径。
   无显示环境若要离屏渲染，确保有可用 GL（本机 `DISPLAY=:1`）
-- `run_gaze_to_flame.py`：GazeTR 推理仍走 subprocess + `sys.executable`（cwd=gazetr/），
-  结果经 **JSON 临时文件**传递 pitch/yaw；FLAME 头部改为**进程内** `FlameMirror` 离屏渲染，
-  再用 `compose_with_head` 与标注图合成单窗口。路径已做绝对化解析（勿改回相对）
+- 设备选择统一走 `common/gpu.py`：`resolve_device("auto"/"cuda")` 用**真实 kernel
+  探测**（ROCm 对不支持芯片 `is_available()` 会误报 True，kernel 才报错，勿改回）；
+  `prepare_amd_gpu_env()` 必须在任何 `import torch` 之前调用（所有入口脚本头部已
+  接好）：设 `HSA_OVERRIDE_GFX_VERSION=10.3.0` + 抢注系统 libdrm——ROCm 版 torch
+  会连带 import 旧 libdrm 破坏 pyrender 的 GLX（NoSuchConfigException），换回
+  CPU/CUDA 构建后此调用无副作用
+- `run_gaze_to_flame.py`：GazeTR 推理默认**进程内**（sys.path 加 gazetr/ 后
+  import model/inference，与 run_webcam 同款）；`--subprocess` 保留旧
+  subprocess + JSON 临时文件链路作回退。FLAME 头部进程内 `FlameMirror` 离屏渲染，
+  `compose_with_head` 合成单窗口。路径已做绝对化解析（勿改回相对）
 - 统一可视化的公共件：几何 `common/geometry.py`、2D 标注 `common/viz.draw_overlay`
   （图片与摄像头共用，勿在 run_webcam/run_gaze_to_flame 里各写一份）、
   FLAME 渲染+合成 `common/flame_mirror.py`（`FlameMirror` 从 run_webcam 抽出，二者共用）
 - `common/flame_mirror.py` 会把 `flame/` 加入 sys.path 并复用 `gaze_viewer` 的
-  build_scene/estimate_eye_centers 等函数，因此 `flame/gaze_viewer.py` 仍是单看 3D 的入口
+  estimate_eye_centers/forward_to_axis_angle/make_cylinder_between 等函数，
+  因此 `flame/gaze_viewer.py` 仍是单看 3D 的入口
+- **FlameMirror 的场景只在 `__init__` 建一次，`render()` 仅 set_pose 两个 gaze-root
+  节点 + 复用缓存的 GPU buffer**——实时 `--flame` 的 fps 全靠这一点（每帧重建
+  场景实测 140ms/帧 → 5.4ms），勿改回每帧 `build_scene`。头部网格冻结在
+  eye_pose=0（FLAME 眼姿只动插座内皮肤色眼球顶点，可见的黑眼珠是独立的
+  sclera/pupil 球体，像素级比对差 <0.03%）。`_install_color_only_readback`
+  是对 **pyrender 0.1.39 内部**（`Renderer._main_fb/_main_fb_ms/_main_fb_dims/
+  _read_main_framebuffer`）的实例级补丁，跳过无人用的深度 glReadPixels（~28ms/帧）；
+  升级 pyrender 时若属性对不上会自动回退到原始路径（只是变慢，不会出错）
+- run_webcam 的 `--head-size` 默认 480=摄像头高度（compose 1:1 显示，GL 回读
+  开销随面积增长，开大只亏帧率）；无 --flame 的 GPU 路径被占空比护栏限速到
+  ~10fps 属预期（见上文），--flame 走 cpu 推理不受护栏影响
 - 视线几何换算统一在 `common/geometry.py`；`gazetr/gtools.py` 保留上游实现
   （gazetr 内部使用），不要在别处再复制一份数学公式
 - 人脸检测/对齐统一在 `common/face.py`（dlib 检测 + ETH-XGaze 6点归一化，

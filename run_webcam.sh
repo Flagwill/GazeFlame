@@ -6,10 +6,11 @@
 #   ./run_webcam.sh --flame                # 打开 FLAME 头部镜像窗口
 #   ./run_webcam.sh --video clip.mp4       # 处理视频文件
 #   ./run_webcam.sh --camera 1 --no-mirror # 指定摄像头, 关闭镜像
-#   DEVICE=cuda ./run_webcam.sh            # 有 GPU 时用 cuda
+#   DEVICE=cpu ./run_webcam.sh         # 强制 CPU (默认 auto: 有 GPU 自动用)
 #
 # 交互: q/ESC 退出, s 保存快照
 # 无显示环境 (服务器/CI): 加 --headless --save-frames out/
+# 注意: ROCm 核显上 --flame 会因 GL+GPU 共载风险自动回退 cpu 推理 (见 common/gpu.py)
 
 set -euo pipefail
 
@@ -40,12 +41,8 @@ if [[ ! -x "${PY}" ]]; then
   exit 1
 fi
 
+# GPU 探测与 AMD ROCm 环境变量由 Python 端 common/gpu.py 负责
+# (shell 里 torch.cuda.is_available() 对 ROCm 不支持的芯片会误报 True)。
 DEVICE="${DEVICE:-auto}"
-if [[ "${DEVICE}" == "cuda" ]]; then
-  if ! "${PY}" -c "import sys,torch;sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
-    echo "警告: DEVICE=cuda 但未检测到可用 GPU, 回退到 cpu" >&2
-    DEVICE="cpu"
-  fi
-fi
 
 exec "${PY}" "${REPO_ROOT}/run_webcam.py" --device "${DEVICE}" "$@"
