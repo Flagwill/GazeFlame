@@ -2,7 +2,7 @@
 # GazeFlame 实时摄像头/视频流视线追踪 (GazeTR + 可选 FLAME 头部镜像)
 #
 # 用法:
-#   ./run_webcam.sh                        # 摄像头 0, 自动镜像, CPU
+#   ./run_webcam.sh                        # 摄像头 0, 自动镜像, auto 选择可用 GPU
 #   ./run_webcam.sh --flame                # 打开 FLAME 头部镜像窗口
 #   ./run_webcam.sh --video clip.mp4       # 处理视频文件
 #   ./run_webcam.sh --camera 1 --no-mirror # 指定摄像头, 关闭镜像
@@ -10,7 +10,8 @@
 #
 # 交互: q/ESC 退出, s 保存快照
 # 无显示环境 (服务器/CI): 加 --headless --save-frames out/
-# 注意: ROCm 核显上 --flame 会因 GL+GPU 共载风险自动回退 cpu 推理 (见 common/gpu.py)
+# 注意: ROCm 核显上无 --flame 的 auto 使用 GPU+占空比护栏；--flame 因 GL+HIP
+# 共载风险自动回退 cpu 推理 (见 common/gpu.py)
 
 set -euo pipefail
 

@@ -96,12 +96,13 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
   5ms、batch=16 约 35ms。**坑（关键）**：核显与显示共享内存，**背靠背满载**
   forward 到 ~300 次(b1)/60-120 次(b16) 必现 GPU Hang + amdgpu MODE2 reset
   （`HSA_ENABLE_SDMA=0`、禁用 fused SDPA 均无效；挂死后重启才恢复）。
-  **对策 = 占空比护栏** `common/gpu.py:rocm_igpu_guard(device, elapsed)`：把相邻
-  两次 GPU forward 的间隔补足到 `ROCM_SAFE_INTERVAL`(100ms)。实测该间隔下
-  满载 120×16 批、3000 帧 duty、600 帧 webcam 全流水线均零故障。真实摄像头
-  天然 ~10fps（间隔>100ms）时护栏为 no-op，不损实时性；快速视频回放 / 大批量
-  文件夹会被限速到 ~10fps 以保安全。已接入 `run_webcam.py` 主循环与
-  `gazetr/inference.py` 批循环。稳定 AMD 独显可 `GAZE_ROCM_SAFE_MODE=0` 关闭。
+  **对策 = 占空比护栏 + 兼容 kernel**：`common/gpu.py:rocm_igpu_guard(device,
+  elapsed)` 把相邻两次 GPU forward 的间隔补足到 `ROCM_SAFE_INTERVAL`(默认 100ms)，
+  并由 `prepare_amd_gpu_env` 默认设置 `MIOPEN_DEBUG_GCN_ASM_KERNELS=0`，避免
+  gfx1035 的 GCN 汇编 kernel 在长时间重复 forward 后 page fault。通用 HIP kernel
+  仍然使用 GPU；实测兼容模式下 220 帧无窗口实时流水线完整通过。稳定 AMD 独显可用
+  `GAZE_ROCM_SAFE_KERNELS=0` 恢复汇编 kernel，再按需用 `GAZE_ROCM_SAFE_MODE=0`
+  关闭占空比护栏。快速视频回放 / 大批量文件夹仍会被限速到约 6fps 以保安全。
   单张图 run.sh 仍默认 cpu（GPU 上下文初始化多花 ~1.5s，单图不划算；
   DEVICE=cuda 显式开启则走 GPU）。
   **第二个坑（2026-09-10 夜修复）：HIP 与持续 OpenGL 渲染互斥**。`run_webcam
@@ -151,17 +152,28 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
 - `common/flame_mirror.py` 会把 `flame/` 加入 sys.path 并复用 `gaze_viewer` 的
   estimate_eye_centers/forward_to_axis_angle/make_cylinder_between 等函数，
   因此 `flame/gaze_viewer.py` 仍是单看 3D 的入口
-- **FlameMirror 的场景只在 `__init__` 建一次，`render()` 仅 set_pose 两个 gaze-root
-  节点 + 复用缓存的 GPU buffer**——实时 `--flame` 的 fps 全靠这一点（每帧重建
-  场景实测 140ms/帧 → 5.4ms），勿改回每帧 `build_scene`。头部网格冻结在
-  eye_pose=0（FLAME 眼姿只动插座内皮肤色眼球顶点，可见的黑眼珠是独立的
-  sclera/pupil 球体，像素级比对差 <0.03%）。`_install_color_only_readback`
+- **FlameMirror 的场景只在 `__init__` 建一次，`render()` 仅 set_pose 一个
+  head-root、两个 gaze-root 和四个眼睑节点 + 复用缓存的 GPU buffer**——实时
+  `--flame` 的 fps 全靠这一点（旧实现每帧重建场景实测 140ms/帧 → 5.4ms），
+  勿改回每帧 `build_scene`。头部网格冻结在 eye_pose=0（FLAME 眼姿只动插座内
+  皮肤色眼球顶点，可见的虹膜/瞳孔/高光是独立的眼部网格，像素级比对差
+  <0.03%）。`_install_color_only_readback`
   是对 **pyrender 0.1.39 内部**（`Renderer._main_fb/_main_fb_ms/_main_fb_dims/
   _read_main_framebuffer`）的实例级补丁，跳过无人用的深度 glReadPixels（~28ms/帧）；
   升级 pyrender 时若属性对不上会自动回退到原始路径（只是变慢，不会出错）
 - run_webcam 的 `--head-size` 默认 480=摄像头高度（compose 1:1 显示，GL 回读
   开销随面积增长，开大只亏帧率）；无 --flame 的 GPU 路径被占空比护栏限速到
-  ~10fps 属预期（见上文），--flame 走 cpu 推理不受护栏影响
+  ~8-10fps 属预期（见上文），ROCm 实时 `auto` 默认走 GPU 并启用 100ms 占空比
+  护栏；可用 `GAZE_ROCM_SAFE_INTERVAL=0.20` 增加余量，稳定 AMD 独显可用
+  `GAZE_ROCM_SAFE_MODE=0` 关闭护栏。`--flame` 仍按 `flame_realtime_device` 回退
+  cpu，以避免 HIP 与持续 GL 渲染共载，不受该护栏影响。
+- 由于当前环境的 gfx1035 需要 ISA override，实时入口默认禁用 MIOpen GCN 汇编
+  kernel（`MIOPEN_DEBUG_GCN_ASM_KERNELS=0`），仍是 GPU 推理；稳定 AMD 独显可用
+  `GAZE_ROCM_SAFE_KERNELS=0` 恢复。
+- ROCm 核显的实时 GUI 默认由 `prepare_rocm_display_env` 设置 HighGUI/Qt 使用
+  XCB + 软件光栅化（`LIBGL_ALWAYS_SOFTWARE=1`），而 GazeTR 仍运行在 GPU；这是
+  为隔离桌面合成与 HIP 负载。确认稳定桌面后可设 `GAZE_ROCM_SOFTWARE_DISPLAY=0`
+  关闭；`--headless` 和 `--flame` 不套用此显示变量。
 - 视线几何换算统一在 `common/geometry.py`；`gazetr/gtools.py` 保留上游实现
   （gazetr 内部使用），不要在别处再复制一份数学公式
 - 人脸检测/对齐统一在 `common/face.py`（dlib 检测 + ETH-XGaze 6点归一化，

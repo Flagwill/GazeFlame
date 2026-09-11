@@ -46,7 +46,9 @@ class TransformerEncoderLayer(nn.Module):
         self.activation = nn.ReLU(inplace=True)
 
     def pos_embed(self, src, pos):
-        batch_pos = pos.unsqueeze(1).repeat(1, src.size(1), 1)
+        # ``expand`` broadcasts the fixed positional table without allocating
+        # a copy for every encoder layer and batch item.
+        batch_pos = pos.unsqueeze(1).expand(-1, src.size(1), -1)
         return src + batch_pos
         
 
@@ -116,7 +118,7 @@ class Model(nn.Module):
         feature = feature.flatten(2)
         feature = feature.permute(2, 0, 1)
         
-        cls = self.cls_token.repeat( (1, batch_size, 1))
+        cls = self.cls_token.expand(-1, batch_size, -1)
         feature = torch.cat([cls, feature], 0)
         
         pos_feature = self.pos_embedding(self.positions)

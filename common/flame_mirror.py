@@ -5,8 +5,8 @@ offscreen pyrender context, returning a BGR numpy image ready for cv2.
 
 Realtime design (important for fps):
     The pyrender Scene is built ONCE in ``__init__`` and reused by every
-    ``render()`` call: the head mesh, sclerae and the pupil+arrow meshes live
-    in fixed nodes and only two "gaze root" node poses are updated per frame.
+    ``render()`` call: the head mesh, sclerae, lids and pupil/arrow meshes live
+    in fixed nodes and only the head/eye/lid node poses are updated per frame.
     Rebuilding the whole scene per frame cost ~44ms (trimesh + from_trimesh)
     AND invalidated pyrender's per-context buffer cache, pushing a 640x640
     render to ~140ms and capping ``run_webcam --flame`` at ~10fps.
@@ -99,12 +99,12 @@ def _install_color_only_readback(offscreen_renderer) -> bool:
 class FlameMirror:
     """Reusable FLAME head whose eyeballs track a live gaze direction.
 
-    The 3D scene (head + per-eye sclera/pupil/arrow) is constructed once in
-    ``__init__``; ``render()`` only updates two node poses and reuses the
+    The 3D scene (head + per-eye sclera/iris/pupil/lids/arrow) is constructed
+    once in ``__init__``; ``render()`` only updates node poses and reuses the
     cached GPU buffers.
     """
 
-    def __init__(self, device="cpu", width=320, height=320):
+    def __init__(self, device="cpu", width=320, height=320, show_arrows=True):
         import pyrender
         import trimesh
 
@@ -115,6 +115,7 @@ class FlameMirror:
         self._gv = gaze_viewer
         self.width = width
         self.height = height
+        self.show_arrows = bool(show_arrows)
 
         config = FLAMEConfig()
         config.batch_size = 1
@@ -162,11 +163,19 @@ class FlameMirror:
             landmarks_np, joints_np
         )
         self._eye_centers = (left_center, right_center)
+        self._face_scale = float(face_scale)
+        # The old fixed z=1 camera made the FLAME head occupy only a small
+        # fraction of the panel because this model is roughly 0.15 units wide.
+        # Scale the camera to the model once; render() still only updates nodes.
+        camera_distance = max(self._face_scale * 2.4, 0.18)
+        self._camera_pos = np.array([0.0, 0.0, camera_distance], dtype=np.float32)
 
         eye_dist = float(np.linalg.norm(left_center - right_center))
         sclera_radius = max(eye_dist * 0.18, 0.008)
         pupil_radius = sclera_radius * 0.45
         eye_offset = sclera_radius * 0.2
+        self._sclera_radius = sclera_radius
+        self._eye_offset = eye_offset
         gaze_len = face_scale * 0.6
         line_radius = max(face_scale * 0.005, 0.0025)
         arrow_len = face_scale * 0.12
@@ -177,7 +186,12 @@ class FlameMirror:
 
         head_colors = np.ones([vertices_np.shape[0], 4]) * [0.83, 0.72, 0.62, 1.0]
         tri_mesh = trimesh.Trimesh(vertices_np, self.flame.faces, vertex_colors=head_colors)
-        scene.add(pyrender.Mesh.from_trimesh(tri_mesh, smooth=True))
+        self._head_root = pyrender.Node(name="head_root")
+        scene.add_node(self._head_root)
+        scene.add(
+            pyrender.Mesh.from_trimesh(tri_mesh, smooth=True),
+            parent_node=self._head_root,
+        )
 
         # 每只眼睛一个 "gaze root" 节点 (世界平移=socket 中心, 姿态=视线旋转)。
         # 子网格全部沿局部 +Z 建一次; render() 里 set_pose 整组转动。球体绕
@@ -202,9 +216,10 @@ class FlameMirror:
         self._gaze_roots = []
         for center in (left_center, right_center):
             root = pyrender.Node(name=f"gaze_root_{center[0]:.4f}")
-            scene.add_node(root)
+            scene.add_node(root, parent_node=self._head_root)
 
             sclera = trimesh.creation.uv_sphere(radius=sclera_radius)
+            sclera.apply_scale([1.0, 0.92, 1.12])
             sclera.visual.vertex_colors = np.tile(
                 np.array(gv.SCLERA_COLOR, dtype=np.float32),
                 (sclera.vertices.shape[0], 1),
@@ -212,20 +227,67 @@ class FlameMirror:
             sclera.apply_translation([0.0, 0.0, eye_offset])
             scene.add(pyrender.Mesh.from_trimesh(sclera), parent_node=root)
 
-            pupil = trimesh.creation.uv_sphere(radius=pupil_radius)
+            iris = trimesh.creation.uv_sphere(radius=sclera_radius * 0.64)
+            iris.visual.vertex_colors = np.tile(
+                np.array((0.20, 0.10, 0.045, 1.0), dtype=np.float32),
+                (iris.vertices.shape[0], 1),
+            )
+            iris.apply_translation([0.0, 0.0, eye_offset + sclera_radius * 0.82])
+            scene.add(pyrender.Mesh.from_trimesh(iris), parent_node=root)
+
+            pupil = trimesh.creation.uv_sphere(radius=pupil_radius * 0.72)
             pupil.visual.vertex_colors = np.tile(
-                np.array(gv.PUPIL_COLOR, dtype=np.float32),
+                np.array((0.018, 0.012, 0.008, 1.0), dtype=np.float32),
                 (pupil.vertices.shape[0], 1),
             )
-            pupil.apply_translation([0.0, 0.0, eye_offset + sclera_radius])
+            pupil.apply_translation([0.0, 0.0, eye_offset + sclera_radius * 1.14])
             scene.add(pyrender.Mesh.from_trimesh(pupil), parent_node=root)
 
-            scene.add(pyrender.Mesh.from_trimesh(arrow_mesh.copy()), parent_node=root)
-            self._gaze_roots.append((root, np.asarray(center, dtype=np.float64)))
+            highlight = trimesh.creation.uv_sphere(radius=sclera_radius * 0.12)
+            highlight.visual.vertex_colors = np.tile(
+                np.array((1.0, 1.0, 1.0, 1.0), dtype=np.float32),
+                (highlight.vertices.shape[0], 1),
+            )
+            highlight.apply_translation(
+                [-sclera_radius * 0.24, sclera_radius * 0.27,
+                 eye_offset + sclera_radius * 1.22]
+            )
+            scene.add(pyrender.Mesh.from_trimesh(highlight), parent_node=root)
+
+            # Skin-colored upper/lower lids are moved toward the center during
+            # a blink.  They remain part of the cached scene.
+            lid_color = np.array((0.70, 0.53, 0.43, 1.0), dtype=np.float32)
+            upper_lid = trimesh.creation.uv_sphere(radius=1.0)
+            upper_lid.apply_scale([sclera_radius * 1.25,
+                                   sclera_radius * 0.34,
+                                   sclera_radius * 0.23])
+            upper_lid.visual.vertex_colors = np.tile(
+                lid_color, (upper_lid.vertices.shape[0], 1)
+            )
+            upper_node = pyrender.Node(name=f"upper_lid_{center[0]:.4f}")
+            scene.add_node(upper_node, parent_node=root)
+            scene.add(pyrender.Mesh.from_trimesh(upper_lid), parent_node=upper_node)
+
+            lower_lid = trimesh.creation.uv_sphere(radius=1.0)
+            lower_lid.apply_scale([sclera_radius * 1.25,
+                                   sclera_radius * 0.34,
+                                   sclera_radius * 0.23])
+            lower_lid.visual.vertex_colors = np.tile(
+                lid_color, (lower_lid.vertices.shape[0], 1)
+            )
+            lower_node = pyrender.Node(name=f"lower_lid_{center[0]:.4f}")
+            scene.add_node(lower_node, parent_node=root)
+            scene.add(pyrender.Mesh.from_trimesh(lower_lid), parent_node=lower_node)
+
+            if self.show_arrows:
+                scene.add(pyrender.Mesh.from_trimesh(arrow_mesh.copy()), parent_node=root)
+            self._gaze_roots.append(
+                (root, np.asarray(center, dtype=np.float64), upper_node, lower_node)
+            )
 
         camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
         cam_pose = np.eye(4)
-        cam_pose[2, 3] = 1.0
+        cam_pose[2, 3] = camera_distance
         scene.add(camera, pose=cam_pose)
         scene.add(
             pyrender.DirectionalLight(color=np.ones(3), intensity=2.0), pose=cam_pose
@@ -238,25 +300,73 @@ class FlameMirror:
             )
         self._scene = scene
 
-    def render(self, gaze: np.ndarray) -> np.ndarray:
-        """Render the head looking along ``gaze``; return a BGR numpy image."""
+    def render(
+        self,
+        gaze: np.ndarray,
+        head_pose: np.ndarray | None = None,
+        blink: float = 0.0,
+    ) -> np.ndarray:
+        """Render head pose, converged eyes and blink state to a BGR image.
+
+        ``gaze`` is expressed in the render/world frame.  ``head_pose`` is an
+        FLAME axis-angle vector in that frame; eye directions are converted
+        back into head-local coordinates before their individual roots rotate.
+        """
         gv = self._gv
-        target_gaze = gv.normalize(np.asarray(gaze, dtype=np.float32))
+        gaze_value = np.asarray(gaze, dtype=np.float32)
+        if not np.all(np.isfinite(gaze_value)):
+            raise ValueError("gaze contains NaN or infinity")
+        target_gaze = gv.normalize(gaze_value)
         if np.dot(target_gaze, (self._camera_pos - self._eye_centers[0])) < 0:
             target_gaze = -target_gaze
 
-        axis_angle = gv.forward_to_axis_angle(target_gaze)
-        rot, _ = cv2.Rodrigues(axis_angle.astype(np.float64))
+        if head_pose is None:
+            head_rotation = np.eye(3, dtype=np.float64)
+        else:
+            pose = np.asarray(head_pose, dtype=np.float64)
+            if not np.all(np.isfinite(pose)):
+                pose = np.zeros(3, dtype=np.float64)
+            if pose.shape == (3, 3):
+                head_rotation = pose
+            else:
+                head_rotation, _ = cv2.Rodrigues(pose.reshape(3, 1))
+        head_pose_matrix = np.eye(4, dtype=np.float64)
+        head_pose_matrix[:3, :3] = head_rotation
+        self._scene.set_pose(self._head_root, head_pose_matrix)
 
-        base_pose = np.eye(4)
-        base_pose[:3, :3] = rot
-        for root, center in self._gaze_roots:
-            base_pose[:3, 3] = center
-            self._scene.set_pose(root, base_pose.copy())
+        # A finite target, rather than parallel rays, makes the pupils gently
+        # converge.  This is more natural at close range and remains stable for
+        # all directions produced by the 2D gaze model.
+        local_gaze = head_rotation.T @ target_gaze.astype(np.float64)
+        convergence_distance = max(self._face_scale * 8.0, 0.1)
+        target = local_gaze * convergence_distance
+        blink = float(np.clip(blink, 0.0, 1.0))
+        for root, center, upper_node, lower_node in self._gaze_roots:
+            eye_direction = gv.normalize(target - center)
+            axis_angle = gv.forward_to_axis_angle(eye_direction)
+            rot, _ = cv2.Rodrigues(axis_angle.astype(np.float64))
+            eye_pose = np.eye(4, dtype=np.float64)
+            eye_pose[:3, :3] = rot
+            eye_pose[:3, 3] = center
+            self._scene.set_pose(root, eye_pose)
+
+            lid_z = self._eye_offset + self._sclera_radius * 1.38
+            lid_gap = self._sclera_radius * 1.98 * (1.0 - blink)
+            for node, sign in ((upper_node, 1.0), (lower_node, -1.0)):
+                lid_pose = np.eye(4, dtype=np.float64)
+                lid_pose[:3, 3] = [0.0, sign * lid_gap * 0.5, lid_z]
+                self._scene.set_pose(node, lid_pose)
 
         color, _ = self._renderer.render(self._scene)
         # pyrender 输出是 RGB, cv2 的 imshow/imwrite 需要 BGR。
         return cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+
+    def close(self) -> None:
+        """Release the offscreen context on the thread that owns it."""
+        renderer = getattr(self, "_renderer", None)
+        if renderer is not None:
+            renderer.delete()
+            self._renderer = None
 
 
 # ---------------------------------------------------------------------------

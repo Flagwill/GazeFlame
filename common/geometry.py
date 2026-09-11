@@ -41,10 +41,13 @@ def gaze_to_dict(gaze: np.ndarray) -> dict[str, float]:
 
 def normalize(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     """Return ``v`` normalized; raise if its norm is effectively zero."""
-    norm = np.linalg.norm(v)
-    if norm < eps:
+    value = np.asarray(v, dtype=np.float64)
+    if not np.all(np.isfinite(value)):
+        raise ValueError("Vector contains NaN or infinity, cannot normalize.")
+    norm = np.linalg.norm(value)
+    if not np.isfinite(norm) or norm < eps:
         raise ValueError("Vector norm is zero, cannot normalize.")
-    return v / norm
+    return value / norm
 
 
 def angular_error(gaze1: np.ndarray, gaze2: np.ndarray) -> float:

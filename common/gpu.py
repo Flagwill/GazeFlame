@@ -17,15 +17,17 @@ PyTorch 的 ROCm build 完全复用 ``cuda`` 这套 API 名字：设备字符串
 
 from __future__ import annotations
 
+import math
 import os
+from functools import lru_cache
 
 # gfx1035 (Radeon 680M) 等 RDNA2 非官方支持芯片的 ISA 覆盖值。
 GFX_OVERRIDE_DEFAULT = "10.3.0"
 
 # gfx1035 核显安全占空比（秒）。实测：背靠背满载 ~300-400 次 forward 必现
-# GPU Hang / Memory access fault（reset 后仍复现）；每次 forward 后留
-# >=100ms 空闲则 3000 帧 / 5min + 全流水线 600 帧零故障。
-ROCM_SAFE_INTERVAL = 0.1
+# GPU Hang / Memory access fault（reset 后仍复现）；实测 >=100ms 空闲窗口可
+# 连续运行数千帧。稳定独显不会启用该护栏；也可用环境变量微调本机余量。
+ROCM_SAFE_INTERVAL = 0.10
 
 # ROCm torch wheel 在 torch/lib/ 里捆绑了旧版 libdrm/libdrm_amdgpu，
 # import torch 会把它们带进进程全局符号表，随后 pyrender/pyglet 的 GLX
@@ -69,15 +71,20 @@ def preload_system_libdrm() -> None:
 def prepare_amd_gpu_env() -> None:
     """ROCm 混合环境（GPU 推理 + pyrender）必须在 ``import torch`` 之前调用。
 
-    做两件事：
+    做三件事：
       1. ``os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")`` —
          gfx1035 等非官方芯片否则任何 kernel 都报 invalid device function；
       2. 抢注系统 libdrm — 否则 torch/lib 的旧 libdrm 破坏 pyrender 的 GLX。
+      3. 关闭 MIOpen GCN 汇编卷积 — gfx1035 借助 ISA override 运行汇编 kernel
+         会在长时间重复 forward 后触发 amdgpu page fault；通用 HIP kernel
+         仍然运行在 GPU 上。
 
     纯 CPU / NVIDIA-CUDA build 下两个动作都无副作用，可以无条件调用。
     """
     os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", GFX_OVERRIDE_DEFAULT)
     preload_system_libdrm()
+    if os.environ.get("GAZE_ROCM_SAFE_KERNELS", "1") != "0":
+        os.environ.setdefault("MIOPEN_DEBUG_GCN_ASM_KERNELS", "0")
 
 
 def is_rocm_build() -> bool:
@@ -87,25 +94,61 @@ def is_rocm_build() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
+@lru_cache(maxsize=1)
+def is_rocm_igpu() -> bool:
+    """Return whether the active ROCm device is an integrated GPU.
+
+    The duty-cycle workaround is required for the shared-memory Radeon 680M,
+    but applying it to a discrete AMD card needlessly caps throughput.  An
+    explicit ``GAZE_ROCM_IGPU`` override is provided for unusual systems and
+    test environments; unknown hardware remains conservative.
+    """
+    override = os.environ.get("GAZE_ROCM_IGPU")
+    if override is not None:
+        return override.strip().lower() not in {"0", "false", "no", "off"}
+    try:
+        import torch
+
+        if not is_rocm_build() or not torch.cuda.is_available():
+            return False
+        props = torch.cuda.get_device_properties(0)
+        name = str(getattr(props, "name", "")).lower()
+        # Common AMD integrated-device names, including the Radeon 680M in
+        # the documented deployment.  If the name is not recognizable, use
+        # the conservative path so stability is preferred over peak speed.
+        integrated_markers = (
+            "680m", "660m", "780m", "760m", "740m", "radeon vega",
+            "integrated graphics", "radeon graphics",
+        )
+        if any(marker in name for marker in integrated_markers):
+            return True
+        # A very small reported aperture is characteristic of an iGPU.  Do
+        # not classify larger devices this way because low-end dGPUs exist.
+        total_memory = int(getattr(props, "total_memory", 0) or 0)
+        return 0 < total_memory <= 2 * 1024**3
+    except Exception:  # noqa: BLE001 - hardware probing must never break startup
+        return True
+
+
 def setup_rocm_env() -> None:
     """HIP build 下补上 HSA_OVERRIDE_GFX_VERSION（尊重用户已设置的值）。"""
     if is_rocm_build():
         os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", GFX_OVERRIDE_DEFAULT)
 
 
-def _probe_cuda() -> bool:
+def _probe_cuda() -> tuple[bool, str | None]:
     """真正跑一个小 kernel 验证 GPU 可用（is_available 不够可靠）。"""
     try:
         import torch
 
         if not torch.cuda.is_available():
-            return False
+            return False, "torch.cuda.is_available() 为 False"
         x = torch.rand(64, 64, device="cuda")
         _ = (x @ x).sum()
         torch.cuda.synchronize()
-        return True
-    except Exception:  # noqa: BLE001 - 任何 HIP/CUDA 错误都视为不可用
-        return False
+        return True, None
+    except Exception as exc:  # noqa: BLE001 - 任何 HIP/CUDA 错误都视为不可用
+        return False, str(exc)
 
 
 def resolve_device(requested: str = "auto") -> str:
@@ -114,11 +157,55 @@ def resolve_device(requested: str = "auto") -> str:
     if requested == "cpu":
         return "cpu"
     setup_rocm_env()  # 覆盖值需在首次 CUDA/HIP 调用之前设置
-    if _probe_cuda():
+    gpu_ok, probe_error = _probe_cuda()
+    if gpu_ok:
         return "cuda"
     if requested != "auto":
-        print("警告: 请求了 GPU 但 kernel 探测失败，回退到 cpu")
+        print(f"警告: 请求了 GPU 但 kernel 探测失败 ({probe_error})，回退到 cpu")
+    elif probe_error:
+        print(f"提示: auto 的 GPU kernel 探测失败 ({probe_error})，当前回退到 cpu")
     return "cpu"
+
+
+def rocm_safe_interval(default: float = ROCM_SAFE_INTERVAL) -> float:
+    """Return the validated inter-forward delay for the ROCm duty-cycle guard."""
+    try:
+        value = float(os.environ.get("GAZE_ROCM_SAFE_INTERVAL", default))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value < 0.0:
+        return default
+    return value
+
+
+def synchronize_device(device: str) -> None:
+    """Wait until work queued on a CUDA/ROCm device has actually completed."""
+    if str(device) != "cuda":
+        return
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def prepare_rocm_display_env(device: str, headless: bool,
+                             flame_enabled: bool) -> bool:
+    """Keep HighGUI rendering off an ROCm iGPU while inference stays on GPU.
+
+    On the Radeon 680M, the desktop compositor can contend with HIP even when
+    the application itself does not create a pyrender scene.  HighGUI uses Qt
+    for its window; force its client-side path through XCB/software rasterizer
+    for this narrow live-GUI case.  ``GAZE_ROCM_SOFTWARE_DISPLAY=0`` restores
+    the old display path for systems where this workaround is unnecessary.
+    """
+    if headless or flame_enabled or str(device) != "cuda":
+        return False
+    if not is_rocm_build() or os.environ.get("GAZE_ROCM_SOFTWARE_DISPLAY", "1") == "0":
+        return False
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
+    os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+    return True
 
 
 def rocm_igpu_guard(device: str, elapsed: float,
@@ -126,17 +213,18 @@ def rocm_igpu_guard(device: str, elapsed: float,
     """ROCm 核显占空比护栏：把相邻两次 GPU forward 的间隔补足到 ``interval``。
 
     gfx1035 实测：背靠背满载 ~300-400 次 forward 必现 GPU Hang（详见
-    AGENTS.md 评估结论）；只要每次 forward 后留 >=100ms 空闲，5min/3000 帧
-    与全流水线 600 帧均零故障。CPU / NVIDIA-CUDA 调用下为无操作；
-    真实摄像头天然帧间隔 >100ms 时也是无操作（不会拖慢实时流水线）。
+    AGENTS.md 评估结论）；默认在每次 forward 后留 >=100ms 的安全间隔。
+    CPU / NVIDIA-CUDA 调用下为无操作；真实摄像头天然帧间隔 >100ms 时也是
+    无操作（不会拖慢实时流水线）。
     稳定的 AMD 独显若不需要护栏，可设环境变量 ``GAZE_ROCM_SAFE_MODE=0``。
     """
-    if str(device) != "cuda" or not is_rocm_build():
+    if str(device) != "cuda" or not is_rocm_build() or not is_rocm_igpu():
         return
     if os.environ.get("GAZE_ROCM_SAFE_MODE", "1") == "0":
         return
     import time
 
+    interval = rocm_safe_interval(interval)
     remaining = interval - elapsed
     if remaining > 0:
         time.sleep(remaining)
@@ -148,10 +236,10 @@ def flame_render_device(device: str) -> str:
     pyrender 的离屏渲染本身走 OpenGL(CPU 侧驱动光栅化), FLAME 顶点形变计算量
     极小(batch=1, CPU 上 5ms 级), 放 GPU 对速度无帮助。但把形变丢到这块**与显示
     共享内存的 ROCm 核显**上, 会叠加在 GazeTR 之上让 iGPU 持续满载 → 渲染几十秒
-    即 GPU Hang(实测 --flame 跑一会就 Memory access fault)。所以 ROCm 构建下
-    FLAME 形变一律用 cpu; 其他平台(CPU / NVIDIA 等稳定 CUDA 独显)沿用推理设备。
+    即 GPU Hang(实测 --flame 跑一会就 Memory access fault)。所以 ROCm 核显下
+    FLAME 形变使用 cpu；离散 AMD/NVIDIA CUDA 沿用推理设备。
     """
-    if str(device) == "cuda" and is_rocm_build():
+    if str(device) == "cuda" and is_rocm_build() and is_rocm_igpu():
         return "cpu"
     return device
 
@@ -168,11 +256,26 @@ def flame_realtime_device(requested: str, flame_enabled: bool) -> str:
     数月一致的"纯图形"使用方式（稳定）。
     NVIDIA/CPU 构建、稳定 AMD 独显（GAZE_ROCM_SAFE_MODE=0）不受影响。
     """
+    requested = (requested or "auto").lower()
+    safe_mode = os.environ.get("GAZE_ROCM_SAFE_MODE", "1") != "0"
+
     resolved = resolve_device(requested)
-    if flame_enabled and resolved == "cuda" and is_rocm_build() \
-            and os.environ.get("GAZE_ROCM_SAFE_MODE", "1") != "0":
+    if (flame_enabled and resolved == "cuda" and is_rocm_build()
+            and is_rocm_igpu() and safe_mode):
         print("提示: ROCm 核显与 pyrender 的 GPU 渲染互斥（持续共载会 GPU Hang），"
               "FLAME 实时模式改用 cpu 推理（10fps 实时足够；独显可设 "
               "GAZE_ROCM_SAFE_MODE=0 解除）")
         return "cpu"
+    if (resolved == "cuda" and is_rocm_build() and is_rocm_igpu()
+            and safe_mode and requested == "auto"):
+        print(
+            "提示: ROCm 实时 auto 使用 GPU，已启用占空比护栏 "
+            f"(相邻 kernel 间隔 >= {rocm_safe_interval():.2f}s；可用 "
+            "GAZE_ROCM_SAFE_INTERVAL 调整)"
+        )
+    if resolved == "cuda" and is_rocm_build() \
+            and is_rocm_igpu() \
+            and os.environ.get("MIOPEN_DEBUG_GCN_ASM_KERNELS") == "0":
+        print("提示: 已启用 MIOpen 兼容 kernel 模式（仍使用 GPU）；可用 "
+              "GAZE_ROCM_SAFE_KERNELS=0 恢复汇编 kernel")
     return resolved

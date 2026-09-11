@@ -35,6 +35,7 @@ from common.gpu import flame_render_device, prepare_amd_gpu_env, resolve_device
 prepare_amd_gpu_env()
 
 import cv2
+import numpy as np
 
 from common.geometry import gaze_to_dict, pitch_yaw_to_gaze
 
@@ -137,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "to this directory for debugging")
     parser.add_argument("--head-size", type=int, default=512,
                         help="FLAME panel render edge length (default: 512)")
+    parser.add_argument("--hide-gaze-arrows", action="store_true",
+                        help="hide debug arrows in the FLAME eye panel")
     parser.add_argument("--display-width", type=int, default=1280,
                         help="Max width of the composed window/panel scaling")
     parser.add_argument("--save-image", default=None,
@@ -247,13 +250,44 @@ def main() -> None:
         bgr = cv2.imread(str(source_image))
         if bgr is None:
             raise FileNotFoundError(f"无法读取图片: {source_image}")
-        panel = scale_to_width(bgr, args.display_width // 2)
-        annotated = draw_overlay(panel, pitch, yaw, info=None, show_face=False)
+        face_info = None
+        if not args.no_align:
+            # The batch inference result intentionally stays JSON-friendly;
+            # recover the alignment metadata here for pose/blink-aware FLAME
+            # rendering and the richer overlay.
+            from common.face import align_face_to_gaze_crop
 
-        mirror = FlameMirror(flame_render_device(device), args.head_size, args.head_size)
-        head_img = mirror.render(gaze)
-        print(f"[GazeTR→FLAME] FLAME 渲染阶段耗时 {time.perf_counter() - t_flame:.2f}s")
-        show_or_save(annotated, head_img, save_image, args.headless)
+            try:
+                _, face_info = align_face_to_gaze_crop(bgr)
+                if face_info.get("face_count", 0) == 0:
+                    face_info = None
+            except Exception as exc:
+                print(f"提示: 无法恢复头姿态信息 ({exc})")
+        panel = scale_to_width(bgr, args.display_width // 2)
+        annotated = draw_overlay(
+            panel,
+            pitch,
+            yaw,
+            info=face_info,
+            show_face=face_info is not None,
+        )
+
+        mirror = FlameMirror(
+            flame_render_device(device), args.head_size, args.head_size,
+            show_arrows=not args.hide_gaze_arrows,
+        )
+        try:
+            head_img = mirror.render(
+                gaze,
+                head_pose=face_info.get("head_pose") if face_info else None,
+                blink=0.0 if face_info is None else float(
+                    np.clip((0.28 - face_info.get("eye_aspect_ratio", 0.28)) / 0.10, 0.0, 1.0)
+                ),
+            )
+            print(f"[GazeTR→FLAME] FLAME 渲染阶段耗时 {time.perf_counter() - t_flame:.2f}s")
+            show_or_save(annotated, head_img, save_image, args.headless)
+        finally:
+            mirror.close()
         print(f"[GazeTR→FLAME] 总耗时 {time.perf_counter() - t_pipeline:.2f}s")
 
 

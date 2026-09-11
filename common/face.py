@@ -160,6 +160,123 @@ def _scale_rect(rect, scale: float):
     )
 
 
+class FaceTracker:
+    """Bridge brief detector misses while keeping the face crop current.
+
+    dlib's HOG detector is reliable but a single frame with motion blur or a
+    partial occlusion can return no rectangle.  A correlation tracker is much
+    cheaper than another full-frame HOG scan and is sufficient to carry the
+    landmark predictor across those short gaps.  Periodic detector refreshes
+    correct tracker drift and allow a new face to be acquired after tracking
+    is lost.
+    """
+
+    def __init__(
+        self,
+        detect_interval: int = 6,
+        max_tracking_frames: int = 30,
+        min_tracking_quality: float = 0.0,
+    ):
+        self.detect_interval = max(1, int(detect_interval))
+        self.max_tracking_frames = max(1, int(max_tracking_frames))
+        self.min_tracking_quality = float(min_tracking_quality)
+        self._tracker = None
+        self._frames_since_detection = self.detect_interval
+        self._tracking_frames = 0
+
+    def reset(self) -> None:
+        """Discard the current track so the next frame forces detection."""
+        self._tracker = None
+        self._frames_since_detection = self.detect_interval
+        self._tracking_frames = 0
+
+    @staticmethod
+    def _valid_rect(position, width: int, height: int):
+        """Convert a dlib floating rectangle to a clipped integer rectangle."""
+        import dlib
+
+        left = max(0, min(width - 1, int(round(position.left()))))
+        top = max(0, min(height - 1, int(round(position.top()))))
+        right = max(0, min(width - 1, int(round(position.right()))))
+        bottom = max(0, min(height - 1, int(round(position.bottom()))))
+        if right - left < 20 or bottom - top < 20:
+            return None
+        return dlib.rectangle(left, top, right, bottom)
+
+    def _start(self, image_rgb: np.ndarray, rect) -> bool:
+        try:
+            import dlib
+
+            tracker = dlib.correlation_tracker()
+            tracker.start_track(image_rgb, rect)
+            self._tracker = tracker
+            self._tracking_frames = 0
+            return True
+        except Exception:
+            # Detection remains usable if a particular dlib build does not
+            # support correlation tracking for the current image type.
+            self._tracker = None
+            self._tracking_frames = 0
+            return False
+
+    def locate(self, image_bgr: np.ndarray):
+        """Return ``(rect, metadata)`` for the current frame.
+
+        ``metadata["source"]`` is ``"detected"`` for a fresh HOG result and
+        ``"tracked"`` when the result bridges a detector miss.
+        """
+        h, w = image_bgr.shape[:2]
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        tracked_rect = None
+        tracking_quality = None
+
+        if self._tracker is not None:
+            try:
+                tracking_quality = float(self._tracker.update(image_rgb))
+                tracked_rect = self._valid_rect(
+                    self._tracker.get_position(), w, h
+                )
+                self._tracking_frames += 1
+            except Exception:
+                self.reset()
+
+        detector_due = (
+            self._tracker is None
+            or self._frames_since_detection >= self.detect_interval
+            or self._tracking_frames > self.max_tracking_frames
+            or (
+                tracking_quality is not None
+                and tracking_quality < self.min_tracking_quality
+            )
+        )
+        if detector_due:
+            detected_rect = detect_largest_face(image_bgr)
+            self._frames_since_detection = 0
+            if detected_rect is not None:
+                self._start(image_rgb, detected_rect)
+                return detected_rect, {
+                    "source": "detected",
+                    "tracking_quality": tracking_quality,
+                }
+
+        if (
+            tracked_rect is not None
+            and self._tracking_frames <= self.max_tracking_frames
+            and (
+                tracking_quality is None
+                or tracking_quality >= self.min_tracking_quality
+            )
+        ):
+            self._frames_since_detection += 1
+            return tracked_rect, {
+                "source": "tracked",
+                "tracking_quality": tracking_quality,
+            }
+
+        self.reset()
+        return None, {"source": "none", "tracking_quality": tracking_quality}
+
+
 def landmarks_to_array(shape) -> np.ndarray:
     """Convert a dlib full_object_detection into an (68, 2) numpy array."""
     return np.array([[p.x, p.y] for p in shape.parts()], dtype=np.float64)
@@ -196,6 +313,83 @@ def estimate_head_pose(
     return rvec, tvec
 
 
+def head_pose_to_flame_rotation(rvec: np.ndarray) -> np.ndarray:
+    """Map an OpenCV face rotation into FLAME's y-up coordinate system.
+
+    ``solvePnP`` uses an image-style y-down camera frame while FLAME uses y-up
+    model coordinates.  Flipping y on both sides preserves the rotation's
+    handedness and keeps the neutral pose equal to the identity matrix.
+    """
+    rotation_cv, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    axis_flip = np.diag([1.0, -1.0, 1.0])
+    return axis_flip @ rotation_cv @ axis_flip
+
+
+def head_rotation_to_euler(rotation: np.ndarray) -> np.ndarray:
+    """Return XYZ Euler angles in radians for display/debugging."""
+    rotation = np.asarray(rotation, dtype=np.float64)
+    sy = float(np.hypot(rotation[0, 0], rotation[1, 0]))
+    singular = sy < 1e-6
+    if not singular:
+        angles = np.array(
+            [
+                np.arctan2(rotation[2, 1], rotation[2, 2]),
+                np.arctan2(-rotation[2, 0], sy),
+                np.arctan2(rotation[1, 0], rotation[0, 0]),
+            ]
+        )
+    else:
+        angles = np.array(
+            [
+                np.arctan2(-rotation[1, 2], rotation[1, 1]),
+                np.arctan2(-rotation[2, 0], sy),
+                0.0,
+            ]
+        )
+    return angles
+
+
+def eye_aspect_ratio(landmarks68: np.ndarray) -> float:
+    """Return the mean eye aspect ratio from dlib's 68 landmarks.
+
+    EAR is high when the eye is open and drops during a blink.  It is a
+    deliberately model-free signal, useful for controlling the lightweight
+    FLAME eye geometry without introducing another neural network.
+    """
+    points = np.asarray(landmarks68, dtype=np.float64)
+    if points.shape[0] < 48:
+        raise ValueError("68 facial landmarks are required for eye_aspect_ratio")
+
+    def _single(indices: tuple[int, ...]) -> float:
+        eye = points[list(indices)]
+        width = np.linalg.norm(eye[0] - eye[3])
+        if width < 1e-8:
+            return 0.0
+        return float(
+            (np.linalg.norm(eye[1] - eye[5]) + np.linalg.norm(eye[2] - eye[4]))
+            / (2.0 * width)
+        )
+
+    return 0.5 * (_single((36, 37, 38, 39, 40, 41)) +
+                  _single((42, 43, 44, 45, 46, 47)))
+
+
+def _reprojection_error(
+    landmarks6: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    camera_matrix: np.ndarray,
+) -> float:
+    projected, _ = cv2.projectPoints(
+        FACE_MODEL_3D,
+        rvec,
+        tvec,
+        camera_matrix,
+        np.zeros((4, 1), dtype=np.float64),
+    )
+    return float(np.mean(np.linalg.norm(projected.reshape(-1, 2) - landmarks6, axis=1)))
+
+
 def assumed_camera_matrix(image: np.ndarray, fov_deg: float = DEFAULT_FOV_DEG) -> np.ndarray:
     """Intrinsics for the (unknown) source camera, assuming ``fov_deg``.
 
@@ -217,6 +411,7 @@ def normalize_face_image(
     roi_size: int = ROI_SIZE,
     focal_norm: float = FOCAL_NORM,
     distance_norm: float = DISTANCE_NORM,
+    head_pose: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Warp a detected face into the ETH-XGaze normalized 224x224 crop.
 
@@ -224,7 +419,9 @@ def normalize_face_image(
     repo (``demo.py``).  Returns ``(warped_bgr, warped_landmarks6)``.
     """
     landmarks6 = landmarks6.astype(np.float64)
-    hr, ht = estimate_head_pose(landmarks6, camera_matrix)
+    hr, ht = head_pose if head_pose is not None else estimate_head_pose(
+        landmarks6, camera_matrix
+    )
     hR = cv2.Rodrigues(hr)[0]
     ht = ht.reshape((3, 1))
 
@@ -280,6 +477,7 @@ def normalize_face_image(
 def align_face_to_gaze_crop(
     image_bgr: np.ndarray,
     fov_deg: float = DEFAULT_FOV_DEG,
+    face_tracker: FaceTracker | None = None,
 ):
     """Detect the largest face and return an ETH-XGaze normalized 224 crop.
 
@@ -290,9 +488,13 @@ def align_face_to_gaze_crop(
     If no face is found, ``crop_bgr`` is ``None`` and callers should fall back
     to the naive full-image resize.
     """
-    rect = detect_largest_face(image_bgr)
+    tracking_info = {"source": "detected", "tracking_quality": None}
+    if face_tracker is None:
+        rect = detect_largest_face(image_bgr)
+    else:
+        rect, tracking_info = face_tracker.locate(image_bgr)
     if rect is None:
-        return None, {"face_count": 0}
+        return None, {"face_count": 0, **tracking_info}
 
     _, predictor = _ensure_dlib_ready()
     shape = predictor(image_bgr, rect)
@@ -300,13 +502,33 @@ def align_face_to_gaze_crop(
     landmarks6 = landmarks68[ETH_LANDMARK_INDICES]
 
     camera_matrix = assumed_camera_matrix(image_bgr, fov_deg)
-    crop, warped_lm = normalize_face_image(image_bgr, landmarks6, camera_matrix)
+    rvec, tvec = estimate_head_pose(landmarks6, camera_matrix)
+    crop, warped_lm = normalize_face_image(
+        image_bgr,
+        landmarks6,
+        camera_matrix,
+        head_pose=(rvec, tvec),
+    )
+    head_rotation = head_pose_to_flame_rotation(rvec)
+    head_pose, _ = cv2.Rodrigues(head_rotation)
 
     info = {
         "face_count": 1,
         "rect": [rect.left(), rect.top(), rect.right(), rect.bottom()],
+        **tracking_info,
+        "landmarks68": landmarks68,
         "landmarks6": landmarks6,
         "warped_landmarks6": warped_lm,
+        "rvec": rvec.reshape(3),
+        "tvec": tvec.reshape(3),
+        "camera_matrix": camera_matrix,
+        "head_rotation": head_rotation,
+        "head_pose": head_pose.reshape(3),
+        "head_euler": head_rotation_to_euler(head_rotation),
+        "reprojection_error": _reprojection_error(
+            landmarks6, rvec, tvec, camera_matrix
+        ),
+        "eye_aspect_ratio": eye_aspect_ratio(landmarks68),
     }
     return crop, info
 

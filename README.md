@@ -112,12 +112,53 @@ python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
 DEVICE=cuda ./run_webcam.sh             # 有 GPU 时用 cuda
 # 无显示环境 (服务器/CI):
 ./run_webcam.sh --headless --save-frames out/
+# 九点个人校准（按画面中的目标注视，自动保存 JSON）:
+./run_webcam.sh --calibrate profiles/me.json
+# 加载校准并输出 fixation/saccade/blink 事件:
+./run_webcam.sh --calibration-file profiles/me.json --events-out events.json
+# 关闭 FLAME 眼睛上的调试箭头，只看虹膜/瞳孔/眼睑:
+./run_webcam.sh --flame --hide-gaze-arrows
+# 调整视频流的人脸检测/跟踪容错（默认每 6 帧检测，最多跟踪 30 帧）:
+./run_webcam.sh --face-detect-interval 6 --face-track-frames 30
 ```
+
+视频流默认使用 dlib correlation tracker 桥接短暂的运动模糊、遮挡或单帧检测失败，
+并按周期重新运行全图检测以校正漂移；完全离开画面后会自动清除旧跟踪并重新寻找人脸。
+
+在 ROCm AMD 核显上，实时入口的 `auto` 默认使用 GPU，并启用占空比护栏，避免
+摄像头长时间运行时连续 HIP kernel 触发驱动卡死。默认相邻 forward 间隔至少
+100ms，约 8-10fps；可用 `GAZE_ROCM_SAFE_INTERVAL=0.20` 增加安全余量。程序会按
+设备名称和显存容量区分核显与独显：稳定 AMD 独显默认不受护栏限制；如硬件识别
+不准确，可用 `GAZE_ROCM_IGPU=1` 强制启用或 `GAZE_ROCM_IGPU=0` 强制关闭。
+
+此外，启动时默认关闭 MIOpen 的 GCN 汇编卷积 kernel，避免 gfx1035 通过 ISA
+兼容模式运行数百次后触发 page fault；这仍是 GPU 推理，只是卷积速度会降低。
+稳定 AMD 独显可用 `GAZE_ROCM_SAFE_KERNELS=0` 恢复汇编 kernel。
+
+有窗口时，ROCm 实时入口还会默认把 HighGUI 的显示端切到软件光栅化，GazeTR
+仍然使用 GPU；如确认桌面/驱动稳定，可用 `GAZE_ROCM_SOFTWARE_DISPLAY=0` 恢复
+原显示路径。
+
+`--flame` 会让 pyrender 的 OpenGL 与 ROCm 共用核显，此模式仍自动把 GazeTR
+放到 CPU；不带 `--flame` 的上述命令则使用 GPU 加速。若明确要 GPU，可写
+`DEVICE=cuda ./run_webcam.sh --calibration-file profiles/me.json`。
 
 交互控制：`q`/`ESC` 退出，`s` 保存快照。逐帧执行 人脸检测(降采样, ~30ms) →
 ETH-XGaze 对齐 → GazeTR 推理（CPU 下本机实测约 **10fps**，受摄像头帧率上限约束）；
 加 `--flame` 后 FLAME 头部离屏渲染并按 `--head-fps`（默认 8）节流刷新，
 与标注后的画面合成到**同一个** `GazeFlame` 窗口，不拖慢主画面。
+
+### 实时增强
+
+- `common.temporal.GazeTemporalState` 使用 One Euro 滤波降低角度抖动，计算角速度，
+  并输出 `face_found/face_lost`、`blink_start/blink_end`、`fixation_start/fixation_end`
+  和 `saccade_start/saccade_end` 事件。事件可用 `--events-out` 保存为 JSON。
+- `common.face` 从同一组 68 点关键点提供 EAR、solvePnP 头部轴角和重投影误差；
+  FLAME 的头部、左右眼、上下眼睑是分层节点，头部转动不会再被误当成眼球转动。
+- `--calibrate` 是九点定时校准，会保存一个从个人模型角度到屏幕坐标的二维仿射 profile；
+  用 `--calibration-file` 加载后，校准结果会在滤波和 FLAME 驱动前应用。
+- `FlameMirror.render(gaze, head_pose, blink)` 复用原有场景和缓冲，只更新头部/眼睛/眼睑
+  节点，加入左右眼会聚、虹膜、瞳孔高光和眨眼遮挡；`--hide-gaze-arrows` 可隐藏辅助箭头。
 
 ## 性能说明
 

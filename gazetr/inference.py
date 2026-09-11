@@ -37,7 +37,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # 必须早于 import torch (ROCm: HSA 覆盖 + 抢注系统 libdrm; CPU/CUDA build 无副作用)。
-from common.gpu import prepare_amd_gpu_env, resolve_device, rocm_igpu_guard  # noqa: E402
+from common.gpu import (  # noqa: E402
+    prepare_amd_gpu_env,
+    resolve_device,
+    rocm_igpu_guard,
+    synchronize_device,
+)
 
 prepare_amd_gpu_env()
 
@@ -161,6 +166,7 @@ def predict_gaze(
     img_bgr: np.ndarray,
     device="cpu",
     align: bool = True,
+    face_tracker=None,
 ) -> tuple[float, float, int, np.ndarray, dict | None]:
     """Run GazeTR on a single BGR frame.
 
@@ -174,7 +180,9 @@ def predict_gaze(
     face_count = 0
     if align:
         try:
-            crop, info = align_face_to_gaze_crop(img_bgr)
+            crop, info = align_face_to_gaze_crop(
+                img_bgr, face_tracker=face_tracker
+            )
             if crop is not None:
                 prep_bgr = crop
                 face_count = int(info["face_count"])
@@ -184,8 +192,12 @@ def predict_gaze(
             info = None
 
     tensor = preprocess_image(prep_bgr, device)
-    with torch.no_grad():
-        gaze = net({"face": tensor}).cpu().numpy()[0]
+    with torch.inference_mode():
+        gaze = net({"face": tensor})
+    # The duty-cycle guard needs a real kernel-completion boundary.  A later
+    # tensor copy usually synchronizes too, but relying on that is backend-specific.
+    synchronize_device(device)
+    gaze = gaze.cpu().numpy()[0]
     return float(gaze[0]), float(gaze[1]), int(face_count), prep_bgr, info
 
 
@@ -326,7 +338,7 @@ def inference(
         os.makedirs(align_dir, exist_ok=True)
         print(f"对齐裁剪图将保存到: {align_dir}")
 
-    with torch.no_grad():
+    with torch.inference_mode():
         processed = 0
         for start in range(0, len(image_paths), batch_size):
             batch_t0 = time.perf_counter()
@@ -345,11 +357,17 @@ def inference(
                 (image_path, bgr, prepare_input_image(image_path, bgr, align, align_dir))
                 for image_path, bgr in loaded
             ]
-            inputs = torch.cat(
-                [preprocess_image(prep_bgr, device) for _, _, (prep_bgr, _) in prepared],
-                dim=0,
-            )
-            gaze_pred = net({"face": inputs}).cpu().numpy()
+            # Build one contiguous CPU batch and perform a single H2D copy.
+            # Per-image ``.to(cuda)`` calls otherwise create many tiny HIP
+            # transfers/allocations and noticeably hurt folder inference.
+            cpu_inputs = [
+                preprocess_image(prep_bgr, "cpu")[0]
+                for _, _, (prep_bgr, _) in prepared
+            ]
+            inputs = torch.stack(cpu_inputs, dim=0).to(device, non_blocking=True)
+            gaze_pred = net({"face": inputs})
+            synchronize_device(device)
+            gaze_pred = gaze_pred.cpu().numpy()
             # gfx1035 核显护栏: 大批量文件夹背靠背 forward 会 GPU Hang,
             # 把相邻批间隔补足到安全占空比 (CPU/CUDA/独显不受影响, 见 common/gpu.py)。
             rocm_igpu_guard(device, time.perf_counter() - batch_t0)
