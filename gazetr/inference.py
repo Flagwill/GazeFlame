@@ -2,7 +2,9 @@
 GazeTR inference script.
 
 Run a pretrained GazeTR model on a single image or a folder of images and
-report gaze pitch/yaw in radians (and degrees).
+report its two raw gaze angles in radians (and degrees).  The checkpoint's
+``gtools.gazeto3d`` convention is angle0=horizontal and angle1=vertical;
+downstream code converts them to an explicit camera-frame vector.
 
 Examples:
     # Single image
@@ -54,11 +56,11 @@ import torch
 
 import model
 from common.face import (
+    DEFAULT_FOV_DEG,
     align_face_to_gaze_crop,
     draw_aligned_overlay,
-    is_gazetr_crop,
 )
-from gtools import gazeto3d
+from common.geometry import gazetr_angles_to_gaze
 
 # Supported input image extensions (upper/lower case).
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
@@ -141,19 +143,21 @@ def prepare_input_image(
     img_bgr: np.ndarray,
     align: bool,
     align_dir: str | None,
+    fov_deg: float = DEFAULT_FOV_DEG,
     verbose: bool = True,
 ) -> tuple[np.ndarray, int]:
     """Return ``(img_bgr, face_count)``, aligning the face when requested.
 
     Runs ETH-XGaze face detection + normalization (``common.face``) so GazeTR
-    sees a training-like normalized crop.  Existing 224x224 inputs are treated
-    as canonical crops and are left unchanged.  Falls back to the raw image
-    (naive resize) when no face is found or dlib fails.
+    sees a training-like normalized crop.  Even 224x224 inputs are aligned
+    when a face is found; use ``align=False`` for a crop that is already in
+    the checkpoint's canonical frame.  Falls back to the raw image (naive
+    resize) when no face is found or dlib fails.
     """
-    if not align or is_gazetr_crop(img_bgr):
+    if not align:
         return img_bgr, 0
     try:
-        crop, info = align_face_to_gaze_crop(img_bgr)
+        crop, info = align_face_to_gaze_crop(img_bgr, fov_deg=fov_deg)
         if crop is None:
             if verbose:
                 print("  警告: 未检测到人脸，回退到直接缩放整图")
@@ -174,22 +178,24 @@ def predict_gaze(
     device="cpu",
     align: bool = True,
     face_tracker=None,
+    fov_deg: float = DEFAULT_FOV_DEG,
 ) -> tuple[float, float, int, np.ndarray, dict | None]:
     """Run GazeTR on a single BGR frame.
 
     Returns ``(pitch, yaw, face_count, prep_bgr, info)`` where ``prep_bgr`` is
     the crop actually fed to the model and ``info`` is the alignment dict from
     ``common.face`` (contains ``rect``/``landmarks6`` for overlays, or None).
-    Existing 224x224 inputs are treated as canonical crops.  Falls back to the
+    Even 224x224 inputs are aligned when a face is found.  Pass ``align=False``
+    for an image that is already a canonical GazeTR crop.  Falls back to the
     raw image when no face is found or alignment fails.
     """
     info: dict | None = None
     prep_bgr = img_bgr
     face_count = 0
-    if align and not is_gazetr_crop(img_bgr):
+    if align:
         try:
             crop, info = align_face_to_gaze_crop(
-                img_bgr, face_tracker=face_tracker
+                img_bgr, fov_deg=fov_deg, face_tracker=face_tracker
             )
             if crop is not None:
                 prep_bgr = crop
@@ -228,7 +234,7 @@ def save_3d_gaze_visualization(
 ) -> None:
     """Save a two-panel figure: the input image and the 3D gaze vector."""
     plt = _import_matplotlib()
-    gaze_vec = gazeto3d(np.array([pitch, yaw]))
+    gaze_vec = gazetr_angles_to_gaze(pitch, yaw)
 
     fig = plt.figure(figsize=(10, 4.5))
 
@@ -260,7 +266,8 @@ def save_3d_gaze_visualization(
     ax2.view_init(elev=20, azim=-55)
 
     fig.suptitle(
-        f"Pitch: {np.degrees(pitch):.2f} deg, Yaw: {np.degrees(yaw):.2f} deg"
+        f"GazeTR angle0: {np.degrees(pitch):.2f} deg, "
+        f"angle1: {np.degrees(yaw):.2f} deg"
     )
     fig.tight_layout()
     fig.savefig(save_path, dpi=160)
@@ -290,8 +297,10 @@ def show_result_popup(image_bgr: np.ndarray, result: dict) -> None:
     label_img.pack()
 
     text = (
-        f"Pitch: {result['pitch_deg']:.2f}° ({result['pitch']:.4f} rad)\n"
-        f"Yaw:   {result['yaw_deg']:.2f}° ({result['yaw']:.4f} rad)"
+        f"GazeTR angle0: {result['pitch_deg']:.2f}° "
+        f"({result['pitch']:.4f} rad)\n"
+        f"GazeTR angle1: {result['yaw_deg']:.2f}° "
+        f"({result['yaw']:.4f} rad)"
     )
     lbl = tk.Label(root, text=text, font=("Arial", 12))
     lbl.pack(pady=6)
@@ -317,6 +326,7 @@ def inference(
     popup: bool = False,
     align: bool = True,
     align_out: str | None = None,
+    fov_deg: float = DEFAULT_FOV_DEG,
 ) -> tuple[list[dict], int]:
     """Run GazeTR over ``image_paths``.
 
@@ -369,7 +379,13 @@ def inference(
                 continue
 
             prepared = [
-                (image_path, bgr, prepare_input_image(image_path, bgr, align, align_dir))
+                (
+                    image_path,
+                    bgr,
+                    prepare_input_image(
+                        image_path, bgr, align, align_dir, fov_deg=fov_deg
+                    ),
+                )
                 for image_path, bgr in loaded
             ]
             # Build one contiguous CPU batch and perform a single H2D copy.
@@ -408,9 +424,13 @@ def inference(
                 if align and face_count > 0:
                     print(f"  人脸: 已对齐 → ETH-XGaze 归一化裁剪 (224x224)")
                 print(
-                    f"  Pitch: {result['pitch']:.4f} rad ({result['pitch_deg']:.2f}°)"
+                    f"  GazeTR angle0: {result['pitch']:.4f} rad "
+                    f"({result['pitch_deg']:.2f}°)"
                 )
-                print(f"  Yaw:   {result['yaw']:.4f} rad ({result['yaw_deg']:.2f}°)")
+                print(
+                    f"  GazeTR angle1: {result['yaw']:.4f} rad "
+                    f"({result['yaw_deg']:.2f}°)"
+                )
 
                 if draw_gaze:
                     try:
@@ -455,7 +475,7 @@ def _write_results(output_file: str, results: list[dict]) -> None:
         )
     else:
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("image_name pitch(rad) yaw(rad) pitch(deg) yaw(deg)\n")
+            f.write("image_name angle0(rad) angle1(rad) angle0(deg) angle1(deg)\n")
             for r in results:
                 f.write(
                     f"{Path(r['image']).name} {r['pitch']:.6f} {r['yaw']:.6f} "
@@ -524,6 +544,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="把对齐后的 224x224 人脸裁剪图(带关键点)保存到该目录, 便于调试",
     )
     parser.add_argument(
+        "--camera-fov", type=float, default=DEFAULT_FOV_DEG,
+        help=f"源摄像头水平视场角(度), 用于 solvePnP (默认: {DEFAULT_FOV_DEG:g})",
+    )
+    parser.add_argument(
         "--device", "-d", type=str, default="auto",
         choices=["auto", "cuda", "cpu", "gpu", "rocm"],
         help="使用的设备 (默认 auto: 探测到可用 GPU 用 cuda, 否则 cpu; "
@@ -573,6 +597,7 @@ def main() -> int:
         popup=args.popup,
         align=args.align,
         align_out=args.align_out,
+        fov_deg=args.camera_fov,
     )
 
     if args.draw_gaze and saved_vis_count == 0:

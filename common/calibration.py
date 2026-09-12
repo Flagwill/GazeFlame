@@ -39,14 +39,33 @@ def angles_to_screen_point(
     return np.clip(point, 0.0, 1.0)
 
 
+def camera_gaze_to_screen_point(
+    pitch: float,
+    yaw: float,
+    max_pitch_deg: float = 30.0,
+    max_yaw_deg: float = 40.0,
+    mirror: bool = False,
+) -> np.ndarray:
+    """Map camera-frame angles (pitch-up/yaw-right) to a display point."""
+    pitch_limit = max(np.radians(float(max_pitch_deg)), 1e-6)
+    yaw_limit = max(np.radians(float(max_yaw_deg)), 1e-6)
+    point = np.array(
+        [0.5 + (-1.0 if mirror else 1.0) * float(yaw) / (2.0 * yaw_limit),
+         0.5 - float(pitch) / (2.0 * pitch_limit)],
+        dtype=np.float64,
+    )
+    return np.clip(point, 0.0, 1.0)
+
+
 @dataclass
 class CalibrationProfile:
-    """Affine map from model angles to normalized screen coordinates."""
+    """Affine map from camera-frame angles to normalized screen coordinates."""
 
     matrix: np.ndarray
     max_pitch_deg: float = 30.0
     max_yaw_deg: float = 40.0
     rmse: float = 0.0
+    feature_frame: str = "camera_angles"
 
     def is_usable(self, max_rmse: float = MAX_USABLE_RMSE) -> bool:
         """Return whether this profile is finite and fit well enough to use."""
@@ -54,11 +73,14 @@ class CalibrationProfile:
             np.all(np.isfinite(self.matrix))
             and np.isfinite(self.rmse)
             and 0.0 <= self.rmse <= float(max_rmse)
+            and self.feature_frame == "camera_angles"
         )
 
     def screen_point(self, pitch: float, yaw: float) -> np.ndarray:
         feature = np.array([float(pitch), float(yaw), 1.0], dtype=np.float64)
         point = np.asarray(self.matrix, dtype=np.float64) @ feature
+        if not np.all(np.isfinite(point)):
+            return np.array([0.5, 0.5], dtype=np.float64)
         return np.clip(point, 0.0, 1.0)
 
     def correct_angles(self, pitch: float, yaw: float) -> tuple[float, float, np.ndarray]:
@@ -69,11 +91,12 @@ class CalibrationProfile:
 
     def to_dict(self) -> dict:
         return {
-            "version": 1,
+            "version": 2,
             "matrix": np.asarray(self.matrix, dtype=np.float64).tolist(),
             "max_pitch_deg": self.max_pitch_deg,
             "max_yaw_deg": self.max_yaw_deg,
             "rmse": self.rmse,
+            "feature_frame": self.feature_frame,
         }
 
     def save(self, path: str | Path) -> None:
@@ -92,6 +115,13 @@ class CalibrationProfile:
             max_pitch_deg=float(data.get("max_pitch_deg", 30.0)),
             max_yaw_deg=float(data.get("max_yaw_deg", 40.0)),
             rmse=float(data.get("rmse", 0.0)),
+            # Version 1 profiles were fitted against the model's signed yaw,
+            # before head compensation.  Do not silently apply them to the
+            # new camera-frame feature convention.
+            feature_frame=data.get(
+                "feature_frame",
+                "model_angles" if int(data.get("version", 1)) < 2 else "camera_angles",
+            ),
         )
 
 
@@ -113,6 +143,7 @@ class CalibrationSession:
         self.started_at: float | None = None
         self.samples: list[tuple[np.ndarray, np.ndarray]] = []
         self._point_samples = 0
+        self._point_features: list[np.ndarray] = []
         self.finished = False
         self.profile: CalibrationProfile | None = None
 
@@ -142,9 +173,8 @@ class CalibrationSession:
             self.started_at = now
         elapsed = now - self.started_at
         if valid and elapsed >= self.settle_seconds:
-            self.samples.append(
-                (np.array([pitch, yaw, 1.0], dtype=np.float64),
-                 np.array(self.target, dtype=np.float64))
+            self._point_features.append(
+                np.array([pitch, yaw, 1.0], dtype=np.float64)
             )
             self._point_samples += 1
         if elapsed < self.settle_seconds + self.hold_seconds:
@@ -154,9 +184,15 @@ class CalibrationSession:
             # sufficient number of frames; a temporary tracking loss should
             # never produce a misleading profile or crash the live loop.
             return None
+        # A short median per target suppresses blink/tracker/model outliers;
+        # fitting every correlated frame made one noisy hold dominate a whole
+        # calibration profile.
+        feature = np.median(np.vstack(self._point_features), axis=0)
+        self.samples.append((feature, np.array(self.target, dtype=np.float64)))
         self.index += 1
         self.started_at = now
         self._point_samples = 0
+        self._point_features = []
         if self.index < len(self.points):
             return None
         features = np.vstack([item[0] for item in self.samples])

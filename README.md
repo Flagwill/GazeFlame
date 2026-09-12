@@ -86,8 +86,9 @@ DEVICE=cuda ./run.sh                      # 有 GPU 时走 cuda
 
 默认会对任意照片做**人脸检测 + ETH-XGaze 归一化对齐**：dlib 检出最大人脸 →
 68 点关键点 → solvePnP 头部姿态 → 透视 warp 成 224×224 标准正面裁剪，
-与 GazeTR 的训练分布一致（裸图不再被直接拉伸变形）；已经是 224×224 的标准
-GazeTR crop 会直接推理，避免重复 warp。
+与 GazeTR 的训练分布一致（裸图不再被直接拉伸变形）。即使输入恰好是 224×224，
+也会先检测并对齐；只有明确传入 `--no-align` 才跳过，适合已经由 ETH-XGaze
+生成的标准 crop。
 
 ### 2. 只看 GazeTR 视线角度
 
@@ -174,9 +175,11 @@ ETH-XGaze 对齐 → GazeTR 推理（CPU 下本机实测约 **10fps**，受摄�
 加 `--flame` 后 FLAME 头部离屏渲染并按 `--head-fps`（默认 8）节流刷新，
 与标注后的画面合成到**同一个** `GazeFlame` 窗口，不拖慢主画面。
 
-视点十字准星默认按 pitch/yaw 的可视范围估算屏幕位置；加载
-`--calibration-file profiles/me.json` 后会使用九点校准得到的坐标，标记精度更高。
-校准只影响屏幕落点，不会改写 FLAME 的真实视线向量；RMSE 大于 0.15 的校准文件会被忽略，需重新校准。
+视点十字准星会先把 ETH-XGaze 标准化人脸坐标还原到原始相机坐标，再估算屏幕位置；加载
+`--calibration-file profiles/me.json` 后会使用九点个人校准得到的坐标，标记精度更高。
+校准只影响屏幕落点，不会改写 FLAME 的真实视线向量；每个目标点取稳定阶段的中位数，
+可减少眨眼、跟踪抖动对 profile 的影响。RMSE 大于 0.15 的校准文件会被忽略，需重新校准。
+旧版 profile 使用的是未补偿头姿的角度坐标，首次升级后请重新运行一次 `--calibrate`。
 
 ### 实时增强
 
@@ -185,8 +188,8 @@ ETH-XGaze 对齐 → GazeTR 推理（CPU 下本机实测约 **10fps**，受摄�
   和 `saccade_start/saccade_end` 事件。事件可用 `--events-out` 保存为 JSON。
 - `common.face` 从同一组 68 点关键点提供 EAR、solvePnP 头部轴角和重投影误差；
   FLAME 的头部、左右眼、上下眼睑是分层节点，头部转动不会再被误当成眼球转动。
-- `--calibrate` 是九点定时校准，会保存一个从个人模型角度到屏幕坐标的二维仿射 profile；
-  用 `--calibration-file` 加载后，校准结果会在滤波和 FLAME 驱动前应用。
+- `--calibrate` 是九点定时校准，会保存一个从相机坐标角度到屏幕坐标的二维仿射 profile；
+  用 `--calibration-file` 加载后，校准结果只用于屏幕落点，滤波后的真实视线仍用于 FLAME。
 - `FlameMirror.render(gaze, head_pose, blink)` 复用原有场景和缓冲，只更新头部/眼睛/眼睑
   节点，加入左右眼会聚、虹膜、瞳孔高光和眨眼遮挡；`--hide-gaze-arrows` 可隐藏辅助箭头。
 

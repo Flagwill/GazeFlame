@@ -346,14 +346,17 @@ def estimate_head_pose(
 
 
 def head_pose_to_flame_rotation(rvec: np.ndarray) -> np.ndarray:
-    """Map an OpenCV face rotation into FLAME's y-up coordinate system.
+    """Map an OpenCV face rotation into FLAME's render coordinate system.
 
-    ``solvePnP`` uses an image-style y-down camera frame while FLAME uses y-up
-    model coordinates.  Flipping y on both sides preserves the rotation's
-    handedness and keeps the neutral pose equal to the identity matrix.
+    ``solvePnP`` maps the ETH face model (OpenCV-style ``x-right, y-down,
+    z-away``) into the camera frame.  FLAME's render frame is ``x-right,
+    y-up, z-toward-camera``.  The same proper basis change is required on the
+    object and world sides, hence ``B @ R_cv @ B`` with
+    ``B = diag(1, -1, -1)``.  Using only a Y flip leaves the Z axis with the
+    wrong handedness and mirrors yaw/pitch rotations in the rendered head.
     """
     rotation_cv, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
-    axis_flip = np.diag([1.0, -1.0, 1.0])
+    axis_flip = np.diag([1.0, -1.0, -1.0])
     return axis_flip @ rotation_cv @ axis_flip
 
 
@@ -428,6 +431,8 @@ def assumed_camera_matrix(image: np.ndarray, fov_deg: float = DEFAULT_FOV_DEG) -
     The normalization is fairly robust to the exact assumed FOV because the
     virtual-camera scaling re-normalizes the face size anyway.
     """
+    if not np.isfinite(fov_deg) or not 1.0 < float(fov_deg) < 179.0:
+        raise ValueError("camera horizontal FOV must be between 1 and 179 degrees")
     h, w = image.shape[:2]
     focal = float(w) / (2.0 * np.tan(np.radians(fov_deg) / 2.0))
     return np.array(
@@ -479,19 +484,7 @@ def normalize_face_image(
     )
     S = np.diag([1.0, 1.0, z_scale])
 
-    hRx = hR[:, 0]
-    forward = (face_center / distance).reshape(3)
-    down = np.cross(forward, hRx)
-    down_norm = np.linalg.norm(down)
-    if down_norm < 1e-8:
-        raise RuntimeError("cannot build a stable frontalization basis")
-    down = down / down_norm
-    right = np.cross(down, forward)
-    right_norm = np.linalg.norm(right)
-    if right_norm < 1e-8:
-        raise RuntimeError("cannot build a stable frontalization basis")
-    right = right / right_norm
-    R = np.c_[right, down, forward].T
+    R = normalization_rotation_from_pose(hr, ht, face_center=face_center)
 
     W = np.dot(np.dot(cam_norm, S), np.dot(R, np.linalg.inv(camera_matrix)))
 
@@ -501,6 +494,41 @@ def normalize_face_image(
     warped_lm = cv2.perspectiveTransform(lm, W).reshape(6, 2)
 
     return img_warped, warped_lm
+
+
+def normalization_rotation_from_pose(
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    face_center: np.ndarray | None = None,
+) -> np.ndarray:
+    """Build the camera-to-normalized rotation used by ETH-XGaze warping."""
+    hR = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))[0]
+    translation = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+    if face_center is None:
+        face_camera = hR @ FACE_MODEL_3D.T + translation
+        eye_center = np.mean(face_camera[:, 0:4], axis=1).reshape(3, 1)
+        nose_center = np.mean(face_camera[:, 4:6], axis=1).reshape(3, 1)
+        face_center = np.mean(
+            np.concatenate((eye_center, nose_center), axis=1), axis=1
+        ).reshape(3, 1)
+
+    distance = float(np.linalg.norm(face_center))
+    if distance < 1e-8:
+        raise RuntimeError("face center distance is (near) zero")
+
+    hRx = hR[:, 0]
+    forward = (np.asarray(face_center, dtype=np.float64).reshape(3) / distance)
+    down = np.cross(forward, hRx)
+    down_norm = np.linalg.norm(down)
+    if down_norm < 1e-8:
+        raise RuntimeError("cannot build a stable frontalization basis")
+    down /= down_norm
+    right = np.cross(down, forward)
+    right_norm = np.linalg.norm(right)
+    if right_norm < 1e-8:
+        raise RuntimeError("cannot build a stable frontalization basis")
+    right /= right_norm
+    return np.c_[right, down, forward].T
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +571,7 @@ def align_face_to_gaze_crop(
     )
     head_rotation = head_pose_to_flame_rotation(rvec)
     head_pose, _ = cv2.Rodrigues(head_rotation)
+    normalization_rotation = normalization_rotation_from_pose(rvec, tvec)
 
     info = {
         "face_count": 1,
@@ -556,6 +585,7 @@ def align_face_to_gaze_crop(
         "camera_matrix": camera_matrix,
         "head_rotation": head_rotation,
         "head_pose": head_pose.reshape(3),
+        "normalization_rotation": normalization_rotation,
         "head_euler": head_rotation_to_euler(head_rotation),
         "reprojection_error": _reprojection_error(
             landmarks6, rvec, tvec, camera_matrix

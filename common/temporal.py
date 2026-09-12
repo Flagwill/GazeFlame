@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from common.geometry import pitch_yaw_to_gaze
+from common.geometry import gazetr_angles_to_gaze
 
 
 class OneEuroFilter:
@@ -237,7 +237,7 @@ class GazeTemporalState:
         if has_face:
             filtered = self._gaze_filter.update([pitch, yaw], now)
             filtered_pitch, filtered_yaw = map(float, filtered)
-            gaze = pitch_yaw_to_gaze(filtered_pitch, filtered_yaw).astype(np.float64)
+            gaze = gazetr_angles_to_gaze(filtered_pitch, filtered_yaw)
             self._last_pitch_yaw[:] = [filtered_pitch, filtered_yaw]
             self._last_valid_timestamp = now
             if not self._was_valid:
@@ -258,7 +258,7 @@ class GazeTemporalState:
             gaze = (
                 self._last_gaze.copy()
                 if self._last_gaze is not None
-                else pitch_yaw_to_gaze(filtered_pitch, filtered_yaw)
+                else gazetr_angles_to_gaze(filtered_pitch, filtered_yaw)
             )
             velocity = 0.0
             blink = self._blink_value

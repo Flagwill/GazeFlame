@@ -69,10 +69,15 @@ from common.flame_mirror import FlameMirror, compose_with_head  # noqa: E402
 from common.calibration import (  # noqa: E402
     CalibrationProfile,
     CalibrationSession,
-    angles_to_screen_point,
+    camera_gaze_to_screen_point,
 )
-from common.face import FaceTracker, mirrored_face_info  # noqa: E402
-from common.geometry import gazetr_to_flame  # noqa: E402
+from common.face import DEFAULT_FOV_DEG, FaceTracker, mirrored_face_info  # noqa: E402
+from common.geometry import (  # noqa: E402
+    camera_gaze_to_pitch_yaw,
+    camera_to_flame,
+    gaze_to_camera,
+    gazetr_angles_to_gaze,
+)
 from common.temporal import GazeTemporalState  # noqa: E402
 from common.viz import (  # noqa: E402
     WINDOW_TITLE,
@@ -144,6 +149,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "ROCm/AMD GPUs also use 'cuda')")
     parser.add_argument("--no-align", dest="align", action="store_false",
                         default=True, help="disable face detection/alignment")
+    parser.add_argument("--camera-fov", type=float, default=DEFAULT_FOV_DEG,
+                        help="source camera horizontal FOV in degrees for solvePnP "
+                             f"(default: {DEFAULT_FOV_DEG:g})")
     parser.add_argument("--face-detect-interval", type=int, default=6,
                         help="full-frame face detection interval in frames "
                              "(default: 6; tracking handles frames between scans)")
@@ -306,6 +314,7 @@ def main() -> int:
     last_fwd_end = time.perf_counter()
     last_gaze: np.ndarray | None = None
     last_head_pose: np.ndarray | None = None
+    last_normalization_rotation: np.ndarray | None = None
     head_img: np.ndarray | None = None
     read_failures = 0
     temporal = GazeTemporalState()
@@ -352,6 +361,7 @@ def main() -> int:
                     str(device),
                     align=args.align,
                     face_tracker=face_tracker,
+                    fov_deg=args.camera_fov,
                 )
                 last_raw_pitch, last_raw_yaw = raw_pitch, raw_yaw
                 consecutive_inference_errors = 0
@@ -404,9 +414,26 @@ def main() -> int:
             frame_idx += 1
 
             now = time.perf_counter()
+            raw_model_gaze = gazetr_angles_to_gaze(raw_pitch, raw_yaw)
+            normalization_rotation = (
+                info.get("normalization_rotation") if info is not None else None
+            )
+            if normalization_rotation is not None:
+                last_normalization_rotation = normalization_rotation
+            elif last_normalization_rotation is not None:
+                normalization_rotation = last_normalization_rotation
+            raw_camera_gaze = gaze_to_camera(
+                raw_model_gaze, normalization_rotation
+            )
+            calibration_pitch, calibration_yaw = camera_gaze_to_pitch_yaw(
+                raw_camera_gaze
+            )
             if calibration is not None:
                 new_profile = calibration.update(
-                    raw_pitch, raw_yaw, face_count > 0, timestamp=now
+                    calibration_pitch,
+                    calibration_yaw,
+                    face_count > 0,
+                    timestamp=now,
                 )
                 if new_profile is not None:
                     new_profile.save(args.calibrate)
@@ -416,23 +443,31 @@ def main() -> int:
                         f"(RMSE={new_profile.rmse:.4f})"
                     )
 
-            pitch, yaw = raw_pitch, raw_yaw
-            if profile is not None:
-                # Calibration is a mapping to the display target.  It must
-                # not alter the physical gaze vector used by FLAME/events.
-                screen_point = profile.screen_point(raw_pitch, raw_yaw)
-            else:
-                screen_point = angles_to_screen_point(
-                    raw_pitch, raw_yaw, mirror=args.mirror
-                )
             estimate = temporal.update(
-                pitch,
-                yaw,
+                raw_pitch,
+                raw_yaw,
                 face_count=face_count,
                 info=info,
                 timestamp=now,
-                screen_point=screen_point,
             )
+            # Filter first, then map the filtered, head-compensated direction
+            # to the display.  Mapping the raw angles made the crosshair jump
+            # even when the temporal gaze estimate was stable.
+            filtered_camera_gaze = gaze_to_camera(
+                estimate.gaze, normalization_rotation
+            )
+            screen_pitch, screen_yaw = camera_gaze_to_pitch_yaw(
+                filtered_camera_gaze
+            )
+            if profile is not None:
+                # Calibration maps camera-frame angles to display coordinates;
+                # it does not alter the physical vector sent to FLAME.
+                screen_point = profile.screen_point(screen_pitch, screen_yaw)
+            else:
+                screen_point = camera_gaze_to_screen_point(
+                    screen_pitch, screen_yaw, mirror=args.mirror
+                )
+            estimate.screen_point = screen_point
             if estimate.events:
                 for event in estimate.events:
                     event["frame"] = frame_idx
@@ -452,10 +487,17 @@ def main() -> int:
                 mirror=args.mirror,
                 temporal=estimate,
                 screen_point=screen_point,
+                camera_gaze=filtered_camera_gaze,
             )
             if face_count > 0:
-                last_gaze = gazetr_to_flame(estimate.gaze)
-                last_head_pose = estimate.head_pose
+                filtered_camera_gaze = gaze_to_camera(
+                    estimate.gaze, normalization_rotation
+                )
+                last_gaze = camera_to_flame(filtered_camera_gaze)
+                # ``head_pose`` in ``info`` is the current solvePnP rotation.
+                # Do not average Rodrigues-vector components for the render:
+                # rotations live on SO(3), not in a Euclidean coordinate box.
+                last_head_pose = info.get("head_pose") if info is not None else None
 
             if mirror is not None and last_gaze is not None:
                 now = time.time()
@@ -511,8 +553,8 @@ def main() -> int:
                 elapsed = time.time() - fps_t0
                 print(
                     f"frame {frame_idx:5d} | {fps_frames / elapsed:5.1f} fps | "
-                    f"pitch {np.degrees(pitch):+6.1f} deg | "
-                    f"yaw {np.degrees(yaw):+6.1f} deg | face={face_count}"
+                    f"pitch {np.degrees(screen_pitch):+6.1f} deg | "
+                    f"yaw {np.degrees(screen_yaw):+6.1f} deg | face={face_count}"
                 )
                 fps_frames, fps_t0 = 0, time.time()
 

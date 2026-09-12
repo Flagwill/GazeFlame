@@ -60,14 +60,14 @@ GazeTR Inference - Gaze Estimation with Transformer
 开始推理，共 3 张图片...
 ----------------------------------------------------------------------
 [1/3] person1_001.jpg
-  Pitch: -0.1234 rad (-7.07°)
-  Yaw:   0.0567 rad (3.25°)
+  GazeTR angle0: -0.1234 rad (-7.07°)
+  GazeTR angle1: 0.0567 rad (3.25°)
 [2/3] person1_002.jpg
-  Pitch: 0.2341 rad (13.42°)
-  Yaw:   -0.1456 rad (-8.34°)
+  GazeTR angle0: 0.2341 rad (13.42°)
+  GazeTR angle1: -0.1456 rad (-8.34°)
 [3/3] person2_001.jpg
-  Pitch: 0.0123 rad (0.70°)
-  Yaw:   0.0987 rad (5.65°)
+  GazeTR angle0: 0.0123 rad (0.70°)
+  GazeTR angle1: 0.0987 rad (5.65°)
 ----------------------------------------------------------------------
 推理完成！成功处理 3/3 张图片
 
@@ -77,7 +77,7 @@ GazeTR Inference - Gaze Estimation with Transformer
 ### 结果文件格式 (results.txt)
 
 ```
-image_name pitch(rad) yaw(rad) pitch(deg) yaw(deg)
+image_name angle0(rad) angle1(rad) angle0(deg) angle1(deg)
 person1_001.jpg -0.123400 0.056700 -7.07 3.25
 person1_002.jpg 0.234100 -0.145600 13.42 -8.34
 person2_001.jpg 0.012300 0.098700 0.70 5.65
@@ -85,13 +85,10 @@ person2_001.jpg 0.012300 0.098700 0.70 5.65
 
 ## Gaze 参数说明
 
-- **Pitch**（俯仰角）：
-  - 正值：向上看
-  - 负值：向下看
-  
-- **Yaw**（偏航角）：
-  - 正值：向右看
-  - 负值：向左看
+GazeTR 的两个输出按 `gtools.gazeto3d` 解释：`angle0` 是水平角，正值
+对应相机左侧；`angle1` 是垂直角，正值对应相机上方。流水线会先把它们
+转换成 OpenCV 相机向量 `[x右, y下, z远]`，再计算屏幕坐标中的
+`pitch-up/yaw-right`。不要把原始 `angle0/angle1` 直接当成屏幕 pitch/yaw。
 
 - 单位：
   - `rad`：弧度制
@@ -163,8 +160,8 @@ with torch.no_grad():
     data = {'face': img}
     gaze = net(data)
     
-pitch, yaw = gaze[0].cpu().numpy()
-print(f"Pitch: {pitch:.4f} rad, Yaw: {yaw:.4f} rad")
+angle0, angle1 = gaze[0].cpu().numpy()
+print(f"GazeTR angle0: {angle0:.4f} rad, angle1: {angle1:.4f} rad")
 ```
 
 ## 修改记录

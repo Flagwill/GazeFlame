@@ -1,14 +1,16 @@
-"""Gaze geometry helpers shared across the GazeFlame pipeline.
+"""Coordinate transforms shared across the GazeFlame pipeline.
 
-The GazeTR convention maps a 2D (pitch, yaw) pair to a normalized 3D
-direction vector:
+GazeTR's own ``gtools.gazeto3d`` defines its two network outputs ``a0, a1``
+as a direction in the usual ETH-XGaze/OpenCV camera axes::
 
-    x = -cos(yaw) * sin(pitch)
-    y = -sin(yaw)
-    z = -cos(yaw) * cos(pitch)
+    x = -cos(a1) * sin(a0)   # camera right
+    y = -sin(a1)              # camera down
+    z = -cos(a1) * cos(a0)    # camera away from the camera
 
-This module is the single source of truth for that conversion so the
-orchestrator and any downstream consumer never duplicate the math.
+The first output is therefore the horizontal angle (with the opposite sign
+of a screen-right yaw), and the second output is the vertical pitch.  Keeping
+this convention explicit is important: swapping X/Y after this conversion
+would exchange horizontal and vertical gaze.
 """
 
 from __future__ import annotations
@@ -18,34 +20,86 @@ import math
 import numpy as np
 
 
-def pitch_yaw_to_gaze(pitch: float, yaw: float) -> np.ndarray:
-    """Convert gaze pitch/yaw (radians) into a normalized 3D direction vector.
+def gazetr_angles_to_gaze(angle0: float, angle1: float) -> np.ndarray:
+    """Convert the two raw GazeTR outputs into an OpenCV camera vector.
 
     Args:
-        pitch: Pitch angle in radians (positive = looking up).
-        yaw: Yaw angle in radians (positive = looking right).
+        angle0: GazeTR horizontal output (positive points camera-left).
+        angle1: GazeTR vertical output (positive points camera-up).
 
     Returns:
         A normalized ``[x, y, z]`` numpy vector.
     """
-    x = -math.cos(yaw) * math.sin(pitch)
-    y = -math.sin(yaw)
-    z = -math.cos(yaw) * math.cos(pitch)
+    x = -math.cos(angle1) * math.sin(angle0)
+    y = -math.sin(angle1)
+    z = -math.cos(angle1) * math.cos(angle0)
     return np.array([x, y, z], dtype=np.float64)
 
 
-def gazetr_to_flame(gaze: np.ndarray) -> np.ndarray:
-    """Convert a GazeTR vector into FLAME's right/up/forward frame.
+def pitch_yaw_to_gaze(pitch: float, yaw: float) -> np.ndarray:
+    """Backward-compatible name for the GazeTR angle conversion.
 
-    GazeTR stores pitch on its first axis, yaw on its second axis, and uses
-    ``-Z`` for the viewing direction.  FLAME uses the usual model frame:
-    ``+X`` right, ``+Y`` up, ``+Z`` toward the camera.  The conversion is
-    therefore ``[x, y, z] -> [y, -x, -z]``.
+    The historical project name is misleading: these positional arguments
+    are the two values emitted by GazeTR, whose first value controls camera X
+    and whose second value controls camera Y.  New code should use
+    :func:`gazetr_angles_to_gaze` to make that fact visible at call sites.
+    """
+    return gazetr_angles_to_gaze(pitch, yaw)
+
+
+def gazetr_to_flame(gaze: np.ndarray) -> np.ndarray:
+    """Convert a camera-frame GazeTR vector into FLAME's render frame.
+
+    OpenCV uses ``+X`` right, ``+Y`` down and ``+Z`` away from the camera;
+    FLAME's viewer uses ``+X`` right, ``+Y`` up and ``+Z`` toward the camera.
+    """
+    return camera_to_flame(gaze)
+
+
+def gaze_to_camera(
+    gaze: np.ndarray,
+    normalization_rotation: np.ndarray | None = None,
+) -> np.ndarray:
+    """Convert a GazeTR vector to the original camera coordinate frame.
+
+    GazeTR's vector already uses the normalized camera axes.  ETH-XGaze face
+    normalization rotates the original camera into a face-centred frame.
+    ``normalization_rotation`` is that camera-to-normalized rotation, so its
+    transpose restores the direction before frontalization.
     """
     value = np.asarray(gaze, dtype=np.float64).reshape(-1)
     if value.size != 3 or not np.all(np.isfinite(value)):
         raise ValueError("GazeTR vector must contain three finite values.")
-    return np.array([value[1], -value[0], -value[2]], dtype=np.float64)
+
+    camera = value.copy()
+    if normalization_rotation is not None:
+        rotation = np.asarray(normalization_rotation, dtype=np.float64)
+        if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
+            raise ValueError("normalization_rotation must be a finite 3x3 matrix.")
+        camera = rotation.T @ camera
+    return normalize(camera)
+
+
+def camera_to_flame(gaze: np.ndarray) -> np.ndarray:
+    """Convert an image-camera direction to FLAME's right/up/toward-camera frame."""
+    value = normalize(gaze).reshape(3)
+    # OpenCV camera coordinates are right/down/away-from-camera; FLAME uses
+    # right/up/toward-camera.
+    return normalize(np.array([value[0], -value[1], -value[2]], dtype=np.float64))
+
+
+def camera_gaze_to_pitch_yaw(gaze: np.ndarray) -> tuple[float, float]:
+    """Return screen-oriented (pitch-up, yaw-right) angles from camera gaze."""
+    value = normalize(gaze).reshape(3)
+    # In OpenCV camera coordinates, gaze points toward the screen along -Z.
+    # Pitch is recovered from the vertical component against the horizontal
+    # plane; yaw is recovered independently in the X/Z plane.  Using -Z as
+    # pitch's denominator or hypot(X, Z) as yaw's denominator couples the two
+    # angles and is not the inverse of gazetr_angles_to_gaze().
+    horizontal_forward = float(np.hypot(value[0], value[2]))
+    pitch = math.atan2(float(-value[1]), horizontal_forward)
+    yaw = math.atan2(float(value[0]), float(-value[2]))
+    return float(pitch), float(yaw)
 
 
 def gaze_to_dict(gaze: np.ndarray) -> dict[str, float]:

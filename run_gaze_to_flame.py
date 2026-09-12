@@ -7,7 +7,8 @@ Orchestrates the two stages of the GazeFlame pipeline:
    saves a second interpreter startup + a second torch/dlib import (~2s).
    ``--subprocess`` keeps the legacy path (``gazetr/inference.py`` child
    process + JSON temp file) as a fallback.
-2. Convert pitch/yaw to a normalized 3D gaze vector (``common.geometry``).
+2. Convert the two GazeTR angles to a normalized camera gaze vector
+   (``common.geometry``).
 3. Render the FLAME head toward that vector (``common.flame_mirror``) and show
    it side-by-side with the annotated input image in ONE cv2 window.
 
@@ -42,8 +43,15 @@ prepare_amd_gpu_env()
 import cv2
 import numpy as np
 
-from common.geometry import gazetr_to_flame, gaze_to_dict, pitch_yaw_to_gaze
-from common.calibration import angles_to_screen_point
+from common.calibration import camera_gaze_to_screen_point
+from common.face import DEFAULT_FOV_DEG
+from common.geometry import (
+    camera_gaze_to_pitch_yaw,
+    camera_to_flame,
+    gaze_to_camera,
+    gaze_to_dict,
+    gazetr_angles_to_gaze,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_GAZETR_ROOT = REPO_ROOT / "gazetr"
@@ -68,6 +76,7 @@ def run_gaze_inprocess(
     align_out: str | None,
     device: str,
     result_file: Path,
+    fov_deg: float,
 ) -> None:
     """Load GazeTR in this interpreter and write the JSON result file.
 
@@ -93,13 +102,13 @@ def run_gaze_inprocess(
     )
     gaze_inference(
         net, image_paths, device=device, output_file=str(result_file), align=align,
-        align_out=align_out,
+        align_out=align_out, fov_deg=fov_deg,
     )
     print(f"[GazeTR→FLAME] GazeTR 阶段耗时 {time.perf_counter() - t0:.2f}s")
 
 
 def read_gaze_result(result_file: Path) -> dict:
-    """Read the first result (image path + pitch/yaw) from the JSON output."""
+    """Read the first result (image path + raw GazeTR angles) from JSON."""
     try:
         payload = json.loads(result_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -134,11 +143,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Legacy mode: run gazetr/inference.py in a child "
                              "process instead of in-process")
     parser.add_argument("--skip-viewer", action="store_true",
-                        help="Only run GazeTR and print pitch/yaw/gaze; "
+                        help="Only run GazeTR and print angles/gaze; "
                              "do not show the unified window")
     parser.add_argument("--no-align", action="store_true",
                         help="Disable face detection/alignment (ETH-XGaze "
                              "normalization) in the GazeTR stage")
+    parser.add_argument("--camera-fov", type=float, default=DEFAULT_FOV_DEG,
+                        help="source camera horizontal FOV in degrees for solvePnP "
+                             f"(default: {DEFAULT_FOV_DEG:g})")
     parser.add_argument("--align-out", default=None,
                         help="Save aligned 224x224 face crops (with landmarks) "
                              "to this directory for debugging")
@@ -234,6 +246,7 @@ def main() -> None:
                 inference_args += ["--no-align"]
             if args.align_out:
                 inference_args += ["--align-out", str(Path(args.align_out).resolve())]
+            inference_args += ["--camera-fov", str(args.camera_fov)]
             run_python(inference_args, cwd=gazetr_root)
         else:
             if not image_folder and not image_path.exists():
@@ -242,34 +255,21 @@ def main() -> None:
                 gazetr_root, model_path, image_path, image_folder,
                 align=not args.no_align, align_out=args.align_out,
                 device=device, result_file=result_file,
+                fov_deg=args.camera_fov,
             )
 
         result = read_gaze_result(result_file)
         pitch, yaw = result["pitch"], result["yaw"]
-        gaze = pitch_yaw_to_gaze(pitch, yaw)
-        flame_gaze = gazetr_to_flame(gaze)
+        gaze = gazetr_angles_to_gaze(pitch, yaw)
         gaze_dict = gaze_to_dict(gaze)
 
-        print(f"\nPitch: {pitch:.6f} rad, Yaw: {yaw:.6f} rad")
+        print(f"\nGazeTR outputs: angle0={pitch:.6f} rad, angle1={yaw:.6f} rad")
         print(
-            f"Gaze vector: x={gaze_dict['x']:.6f}, "
+            f"Normalized camera gaze: x={gaze_dict['x']:.6f}, "
             f"y={gaze_dict['y']:.6f}, z={gaze_dict['z']:.6f}"
         )
-        flame_dict = gaze_to_dict(flame_gaze)
-        print(
-            f"FLAME vector: x={flame_dict['x']:.6f}, "
-            f"y={flame_dict['y']:.6f}, z={flame_dict['z']:.6f}"
-        )
-
-        if args.skip_viewer:
-            print(f"[GazeTR→FLAME] 总耗时 {time.perf_counter() - t_pipeline:.2f}s")
-            return
-
-        # 统一窗口：左侧标注输入图 + 右侧 FLAME 头部，二者合成到同一画面。
-        t_flame = time.perf_counter()
-        from common.flame_mirror import FlameMirror
-        from common.viz import draw_overlay
-
+        # Recover the same pose metadata for both the viewer and --skip-viewer
+        # so the reported FLAME direction is in the original camera frame.
         source_image = Path(result["image"]).resolve() if result["image"] else image_path
         bgr = cv2.imread(str(source_image))
         if bgr is None:
@@ -279,17 +279,45 @@ def main() -> None:
             # The batch inference result intentionally stays JSON-friendly;
             # recover the alignment metadata here for pose/blink-aware FLAME
             # rendering and the richer overlay.
-            from common.face import align_face_to_gaze_crop, is_gazetr_crop
+            from common.face import align_face_to_gaze_crop
 
-            if not is_gazetr_crop(bgr):
-                try:
-                    _, face_info = align_face_to_gaze_crop(bgr)
-                    if face_info.get("face_count", 0) == 0:
-                        face_info = None
-                except Exception as exc:
-                    print(f"提示: 无法恢复头姿态信息 ({exc})")
+            try:
+                _, face_info = align_face_to_gaze_crop(
+                    bgr, fov_deg=args.camera_fov
+                )
+                if face_info.get("face_count", 0) == 0:
+                    face_info = None
+            except Exception as exc:
+                print(f"提示: 无法恢复头姿态信息 ({exc})")
+        normalization_rotation = (
+            face_info.get("normalization_rotation") if face_info else None
+        )
+        camera_gaze = gaze_to_camera(gaze, normalization_rotation)
+        camera_pitch, camera_yaw = camera_gaze_to_pitch_yaw(camera_gaze)
+        print(
+            f"Camera gaze: pitch={np.degrees(camera_pitch):+.2f} deg, "
+            f"yaw={np.degrees(camera_yaw):+.2f} deg"
+        )
+        flame_gaze = camera_to_flame(camera_gaze)
+        flame_dict = gaze_to_dict(flame_gaze)
+        print(
+            f"FLAME vector: x={flame_dict['x']:.6f}, "
+            f"y={flame_dict['y']:.6f}, z={flame_dict['z']:.6f}"
+        )
+        if args.skip_viewer:
+            print(f"[GazeTR→FLAME] 总耗时 {time.perf_counter() - t_pipeline:.2f}s")
+            return
+
+        # 统一窗口：左侧标注输入图 + 右侧 FLAME 头部，二者合成到同一画面。
+        t_flame = time.perf_counter()
+        from common.flame_mirror import FlameMirror
+        from common.viz import draw_overlay
+
+        screen_pitch, screen_yaw = camera_gaze_to_pitch_yaw(camera_gaze)
+        screen_point = camera_gaze_to_screen_point(
+            screen_pitch, screen_yaw, mirror=False
+        )
         panel = scale_to_width(bgr, args.display_width // 2)
-        screen_point = angles_to_screen_point(pitch, yaw)
         annotated = draw_overlay(
             panel,
             pitch,
@@ -297,6 +325,7 @@ def main() -> None:
             info=face_info,
             show_face=face_info is not None,
             screen_point=screen_point,
+            camera_gaze=camera_gaze,
         )
 
         mirror = FlameMirror(

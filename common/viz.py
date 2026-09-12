@@ -18,6 +18,8 @@ import subprocess
 import cv2
 import numpy as np
 
+from common.geometry import camera_gaze_to_pitch_yaw
+
 
 WINDOW_TITLE = "GazeFlame"
 
@@ -185,15 +187,18 @@ def draw_overlay(
     show_face: bool = True,
     temporal=None,
     screen_point: np.ndarray | tuple[float, float] | None = None,
+    camera_gaze: np.ndarray | None = None,
 ) -> np.ndarray:
     """Draw face box, landmarks and a gaze arrow on a copy of ``frame``.
 
     ``info`` is the alignment dict from ``common.face`` (``rect`` /
     ``landmarks6``); pass ``None`` (or ``show_face=False``) to only draw the
     arrow + text readout.  ``mirror`` flips the arrow's horizontal component to
-    match a selfie mirror feed. ``screen_point`` is used for the normalized
-    coordinate readout; the corresponding full-window marker is drawn by
-    ``draw_screen_point`` after panel composition.
+    match a selfie mirror feed. ``camera_gaze`` optionally supplies the
+    head-compensated direction in the original camera frame. ``screen_point``
+    is used for the normalized coordinate readout; the corresponding
+    full-window marker is drawn by ``draw_screen_point`` after panel
+    composition.
     """
     out = frame.copy()
 
@@ -205,8 +210,15 @@ def draw_overlay(
 
     h, w = out.shape[:2]
     length = min(w, h) * 0.35
-    dx = -length * np.sin(yaw) * np.cos(pitch)
-    dy = -length * np.sin(pitch)
+    readout_pitch, readout_yaw = float(pitch), float(yaw)
+    if camera_gaze is not None:
+        arrow_pitch, arrow_yaw = camera_gaze_to_pitch_yaw(camera_gaze)
+        readout_pitch, readout_yaw = arrow_pitch, arrow_yaw
+        dx = length * np.sin(arrow_yaw) * np.cos(arrow_pitch)
+        dy = -length * np.sin(arrow_pitch)
+    else:
+        dx = -length * np.sin(yaw) * np.cos(pitch)
+        dy = -length * np.sin(pitch)
     if mirror:  # selfie view: mirror the horizontal component too
         dx = -dx
     center = (w // 2, h // 2)
@@ -223,7 +235,8 @@ def draw_overlay(
     scale = max(0.6, min(w, h) / 720.0)
     cv2.putText(
         out,
-        f"pitch {np.degrees(pitch):+6.1f} deg  yaw {np.degrees(yaw):+6.1f} deg",
+        f"pitch {np.degrees(readout_pitch):+6.1f} deg  "
+        f"yaw {np.degrees(readout_yaw):+6.1f} deg",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         scale,
