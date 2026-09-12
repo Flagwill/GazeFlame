@@ -14,7 +14,8 @@ GazeTR（Transformer 视线估计）× FLAME_PyTorch（3D 头部参数模型）�
 两个子项目用 `gazetr/`、`flame/` 子目录隔离（顶层有重名的 model/、config.py 等）。
 共享工具放顶层 `common/`：几何换算唯一数据源 `geometry.py`、2D 视线标注唯一实现
 `viz.py`（draw_overlay，图片/摄像头共用）、FLAME 离屏渲染 + 单窗口合成
-`flame_mirror.py`（FlameMirror / compose_with_head）；编排脚本从仓库根目录导入。
+`flame_mirror.py`（FlameMirror / compose_with_head）、软件-only 辅助控制概念层
+`assistive.py`（视线目标 / 意图状态 / 辅助面板）；编排脚本从仓库根目录导入。
 人脸检测/对齐也放在 `common/face.py`（dlib + ETH-XGaze 归一化，GazeTR 训练同款），
 68 点模型在 `common/models/shape_predictor_68_face_landmarks.dat`（~96MB，gitignore，
 用 `python -m common.download_dlib_model` 下载，断点续传可重跑）。
@@ -58,6 +59,8 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
 # 实时摄像头 / 视频流
 ./run_webcam.sh --flame                       # 摄像头 + FLAME 头部镜像 (统一单窗口)
 ./run_webcam.sh --video clip.mp4              # 视频文件
+./run_webcam.sh --video clip.mp4 --assistive  # 无摄像头的辅助控制概念验证
+./run_webcam.sh --video clip.mp4 --flame --assistive --save-frames out/
 ./run_webcam.sh --headless --save-frames out/ # 无窗口, 存帧 (自动化)
 ```
 
@@ -288,3 +291,42 @@ ISA 不匹配与“坏地址”故障，余量约 6x；但换 kernel 集（非 A
   不到人脸时会打印警告并回退直接缩放，不会中断流水线
 - `flame/config.py` 是 `FLAMEConfig` dataclass，无模块级 parser 副作用；
   `gaze_viewer.py` 用 `add_flame_args + config_from_args` 构造配置
+
+## 辅助控制概念验证层（2026-09-12）
+
+为拉近项目与“机械臂辅助控制飞行模拟器”的关系，新增了一个**纯软件、概念验证级**
+的驾驶员状态感知层。它只表达以下闭环，不模拟真实机械臂、飞行动力学、飞控或物理
+执行器：
+
+```
+GazeTR / FLAME 视线与头姿感知
+        → 抽象驾驶舱关注区域
+        → 注视意图状态
+        → 辅助介入准备状态
+```
+
+- 实现位置：`common/assistive.py`。唯一职责是把归一化视点映射到四个宽泛的概念区域
+  （`SYSTEM STATUS`、`ATTITUDE`、`NAVIGATION`、`CONTROL AREA`），并根据跟踪置信度、
+  视线速度、注视时长和眨眼状态输出可解释的辅助状态。
+- 状态机默认阈值：置信度至少 `0.25`；同一区域注视达到 `0.35s` 后为
+  `INTENT DETECTED`，达到 `0.80s` 后为 `ASSIST READY`。切换到新区域必须重新获得
+  注视时间，不能沿用上一个区域的 fixation 证据。
+- `run_webcam.py --assistive`：实时/视频模式增加 `ASSISTIVE CONTROL CONCEPT` 面板，
+  复用 `common.temporal.GazeTemporalState` 的滤波、注视时长和置信度。使用视频文件
+  （`--video`）时不需要摄像头或其他外置硬件；`--flame --assistive` 会显示输入图、
+  FLAME 头部和辅助状态三类面板。
+- `run_gaze_to_flame.py --assistive`：单图模式显示当前关注区域，但单张图没有时间证据，
+  只显示 `MONITORING`，不能伪造 `INTENT DETECTED` 或 `ASSIST READY`。
+- 视频模式的辅助状态事件以 `assistive_` 前缀写入现有 `--events-out` JSON；启用
+  `--save-frames` 时，标注帧仍写入输出根目录，含辅助面板的合成帧写入 `assistive/`。
+- 面板合成通过 `common.assistive.compose_with_assistive` 完成；FLAME 仍只由
+  `common.flame_mirror` 负责，不能在辅助模块中复制或重建 FLAME 场景。
+- 这是课题的“驾驶员状态感知 → 操作意图识别 → 辅助介入准备”软件闭环，不能在论文或
+  演示中表述为已经完成真实机械臂控制。真实机械臂、飞行模拟器通信和执行器接口属于
+  后续扩展边界。
+- 测试：`tests/test_assistive.py` 覆盖状态机推进、无效跟踪拒绝辅助、面板尺寸稳定性。
+  在 `gaze_flame_rocm` 环境中使用
+  `python -m unittest discover -s tests -v` 验证通过（3 tests）。
+- FLAME 组合图仍继承原有 pyrender/OpenGL 前置条件；没有可用 X11/GL 时，使用
+  `--assistive` 且不加 `--flame` 的视频模式验证概念层，或只运行辅助面板单元测试，
+  不要把 OpenGL 初始化失败误判为辅助状态机错误。
