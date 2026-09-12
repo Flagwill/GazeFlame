@@ -26,7 +26,7 @@ if [[ -z "${CONDA_BIN}" ]]; then
   exit 1
 fi
 
-ENV_NAME="gaze_flame"
+ENV_NAME="gaze_flame_rocm"
 ENV_PATH="$(awk -v n="${ENV_NAME}" '
   $1 == n {print $2; exit}
   $1 == "*" && $2 == n {print $3; exit}' <<< "$("${CONDA_BIN}" env list)")"

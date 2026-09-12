@@ -42,8 +42,11 @@ sys.path.insert(0, str(GAZETR_ROOT))
 
 # 必须早于 import torch (ROCm: HSA 覆盖 + 抢注系统 libdrm; CPU/CUDA build 无副作用)。
 from common.gpu import (  # noqa: E402
+    autocast_gpu,
     flame_realtime_device,
     flame_render_device,
+    fp16_autocast_enabled,
+    is_gpu_runtime_error,
     prepare_amd_gpu_env,
     prepare_rocm_display_env,
     rocm_igpu_guard,
@@ -63,10 +66,22 @@ import model  # noqa: E402
 from inference import predict_gaze  # noqa: E402
 
 from common.flame_mirror import FlameMirror, compose_with_head  # noqa: E402
-from common.calibration import CalibrationProfile, CalibrationSession  # noqa: E402
-from common.face import FaceTracker  # noqa: E402
+from common.calibration import (  # noqa: E402
+    CalibrationProfile,
+    CalibrationSession,
+    angles_to_screen_point,
+)
+from common.face import FaceTracker, mirrored_face_info  # noqa: E402
+from common.geometry import gazetr_to_flame  # noqa: E402
 from common.temporal import GazeTemporalState  # noqa: E402
-from common.viz import draw_calibration_target, draw_overlay  # noqa: E402
+from common.viz import (  # noqa: E402
+    WINDOW_TITLE,
+    create_display_window,
+    draw_calibration_target,
+    draw_overlay,
+    draw_screen_point,
+    fit_to_display,
+)
 
 DEFAULT_MODEL = str(GAZETR_ROOT / "model" / "GazeTR-H-ETH.pt")
 
@@ -80,13 +95,33 @@ def load_gazetr_model(model_path: str, device, warmup: bool = True):
     net.eval()
     if warmup:
         # 预热: 吸收 GPU 首次 kernel/内存池 与 CPU 首次调度的固定开销,
-        # 避免实时流水线第一帧明显变慢。
+        # 避免实时流水线第一帧明显变慢。用与 predict_gaze 相同的精度,
+        # 让 fp16 的 kernel 选择也在首帧前完成。
         dummy = torch.zeros(1, 3, 224, 224, device=device)
-        with torch.inference_mode():
+        with torch.inference_mode(), autocast_gpu(device):
             for _ in range(3):
                 net({"face": dummy})
         synchronize_device(device)
     return net
+
+
+def measure_forward_ms(net, device, repeats: int = 3) -> float:
+    """Time a fixed 1x3x224x224 forward (GPU health probe).
+
+    A ROCm gfx1035 GPU can silently degrade after a VM fault (observed: the
+    same batch-16 forward going 105ms -> 705ms) instead of failing loudly.
+    The live loop uses this to compare against the freshly-loaded baseline and
+    drop to CPU when the accelerator is no longer worth using.
+    """
+    dummy = torch.zeros(1, 3, 224, 224, device=device)
+    with torch.inference_mode(), autocast_gpu(device):
+        net({"face": dummy})
+        synchronize_device(device)
+        start = time.perf_counter()
+        for _ in range(repeats):
+            net({"face": dummy})
+        synchronize_device(device)
+    return (time.perf_counter() - start) / repeats * 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="max FLAME head refresh rate (default: 8)")
     parser.add_argument("--headless", action="store_true",
                         help="no window; process frames and (optionally) save them")
+    parser.add_argument("--windowed", action="store_true",
+                        help="keep the visualization window resizable instead of fullscreen")
     parser.add_argument("--save-frames", type=str, default=None,
                         help="save annotated camera frames (and FLAME head renders) "
                            "to this directory")
@@ -161,8 +198,19 @@ def main() -> int:
 
     profile = None
     if args.calibration_file:
-        profile = CalibrationProfile.load(args.calibration_file)
-        print(f"Loaded calibration: {args.calibration_file} (RMSE={profile.rmse:.4f})")
+        loaded_profile = CalibrationProfile.load(args.calibration_file)
+        if loaded_profile.is_usable():
+            profile = loaded_profile
+            print(
+                f"Loaded calibration: {args.calibration_file} "
+                f"(RMSE={profile.rmse:.4f})"
+            )
+        else:
+            print(
+                f"警告: 校准文件误差过大 (RMSE={loaded_profile.rmse:.4f}), "
+                "忽略该文件；请重新运行 --calibrate。",
+                file=sys.stderr,
+            )
     calibration = (
         CalibrationSession(
             settle_seconds=args.calibration_settle,
@@ -180,6 +228,8 @@ def main() -> int:
     print("Using device:", device)
     if device.type == "cuda":
         print("GPU:", torch.cuda.get_device_name(device))
+    if fp16_autocast_enabled(device):
+        print("提示: 已启用 fp16 autocast 推理 (约 1.3-1.7x; GAZE_ROCM_FP16=0 关闭)")
     if software_display:
         print("提示: ROCm GUI 使用软件显示光栅化，GazeTR 仍使用 GPU")
 
@@ -193,6 +243,13 @@ def main() -> int:
         args.mirror = args.camera is not None  # mirror webcam by default
 
     net = load_gazetr_model(args.model, device)
+    gpu_baseline_ms = 0.0
+    if device.type == "cuda":
+        try:
+            gpu_baseline_ms = measure_forward_ms(net, device)
+            print(f"GPU 前向基线: {gpu_baseline_ms:.1f} ms/帧")
+        except Exception as exc:  # noqa: BLE001 - probe must not block startup
+            print(f"提示: GPU 健康基线测量失败: {exc}", file=sys.stderr)
 
     face_tracker = (
         FaceTracker(
@@ -202,6 +259,15 @@ def main() -> int:
         if args.align
         else None
     )
+
+    def fallback_to_cpu(reason: str) -> None:
+        """Move inference to CPU after GPU faults/degradation; survives in-process."""
+        nonlocal device, net
+        print(f"警告: {reason}，切换到 CPU 推理以保持会话", file=sys.stderr)
+        device = torch.device("cpu")
+        net = load_gazetr_model(args.model, device)
+        if face_tracker is not None:
+            face_tracker.reset()
 
     cap = cv2.VideoCapture(args.video if args.video else args.camera)
     if not cap.isOpened():
@@ -227,6 +293,13 @@ def main() -> int:
     print(f"处理 {source_desc} (按 q/ESC 退出, s 保存快照)")
     print("-" * 60)
 
+    if not args.headless:
+        display_size = create_display_window(
+            WINDOW_TITLE, fullscreen=not args.windowed
+        )
+    else:
+        display_size = None
+
     frame_idx = 0
     fps_frames, fps_t0 = 0, time.time()
     last_head_time = 0.0
@@ -240,8 +313,11 @@ def main() -> int:
     last_raw_pitch, last_raw_yaw = 0.0, 0.0
     inference_errors = 0
     render_errors = 0
+    consecutive_inference_errors = 0
     last_inference_error_time = 0.0
     last_render_error_time = 0.0
+    last_health_time = time.perf_counter()
+    degraded_probes = 0
     head_dir = Path(args.save_frames) / "head" if args.save_frames and mirror else None
     if head_dir:
         head_dir.mkdir(parents=True, exist_ok=True)
@@ -262,20 +338,26 @@ def main() -> int:
                 continue
             read_failures = 0
 
-            if args.mirror:
-                frame = cv2.flip(frame, 1)
+            # Selfie mirroring is a display transform.  Keep model input in
+            # the camera's native orientation to avoid a left/right bias.
+            camera_frame = frame
+            display_frame = (
+                cv2.flip(camera_frame, 1) if args.mirror else camera_frame
+            )
 
             try:
                 raw_pitch, raw_yaw, face_count, _prep, info = predict_gaze(
                     net,
-                    frame,
+                    camera_frame,
                     str(device),
                     align=args.align,
                     face_tracker=face_tracker,
                 )
                 last_raw_pitch, last_raw_yaw = raw_pitch, raw_yaw
+                consecutive_inference_errors = 0
             except Exception as exc:  # noqa: BLE001 - a bad frame must not end a live stream
                 inference_errors += 1
+                consecutive_inference_errors += 1
                 raw_pitch, raw_yaw = last_raw_pitch, last_raw_yaw
                 face_count, info = 0, None
                 now = time.time()
@@ -283,11 +365,42 @@ def main() -> int:
                     print(f"警告: 当前帧推理失败，按丢脸处理: {exc}", file=sys.stderr)
                     traceback.print_exc()
                     last_inference_error_time = now
+                # A dead/erroring HIP context does not recover in-process, so a
+                # long session would otherwise keep reusing the last good angle
+                # forever.  Reload on CPU and keep producing gaze results.
+                if (consecutive_inference_errors >= 3 and device.type == "cuda"
+                        and is_gpu_runtime_error(exc)):
+                    fallback_to_cpu("GPU 推理连续失败")
+                    consecutive_inference_errors = 0
             # gfx1035 核显占空比护栏: 距上一次 forward 结束的间隔补足 100ms。
             # 真实摄像头 (~6fps 以上时可能限速) 仍使用 GPU；--video 快速回放会被限速,
             # 避免背靠背满载触发 GPU Hang (见 common/gpu.py)。
             rocm_igpu_guard(device, time.perf_counter() - last_fwd_end)
             last_fwd_end = time.perf_counter()
+
+            # 周期健康探针: ROCm 核显在 VM fault 后可能进入"无异常但极慢"的
+            # 劣化态 (实测 b16 105ms→705ms)。对比刚加载时的基线, 连续两次远
+            # 超阈值就切到 CPU, 避免表面正常却慢几倍地空转。
+            if device.type == "cuda" and gpu_baseline_ms > 0:
+                if time.perf_counter() - last_health_time >= 10.0:
+                    last_health_time = time.perf_counter()
+                    try:
+                        probe_ms = measure_forward_ms(net, device)
+                    except Exception:  # noqa: BLE001 - a fault here just triggers fallback
+                        probe_ms = None
+                    slow_limit = max(gpu_baseline_ms * 6.0, gpu_baseline_ms + 100.0)
+                    if probe_ms is not None and probe_ms > slow_limit:
+                        degraded_probes += 1
+                        print(
+                            f"警告: GPU 前向 {probe_ms:.0f}ms 远高于基线 "
+                            f"{gpu_baseline_ms:.0f}ms, 疑似劣化 "
+                            f"({degraded_probes}/2)",
+                            file=sys.stderr,
+                        )
+                        if degraded_probes >= 2:
+                            fallback_to_cpu("GPU 持续劣化")
+                    else:
+                        degraded_probes = 0
             frame_idx += 1
 
             now = time.perf_counter()
@@ -303,10 +416,15 @@ def main() -> int:
                         f"(RMSE={new_profile.rmse:.4f})"
                     )
 
-            screen_point = None
             pitch, yaw = raw_pitch, raw_yaw
             if profile is not None:
-                pitch, yaw, screen_point = profile.correct_angles(raw_pitch, raw_yaw)
+                # Calibration is a mapping to the display target.  It must
+                # not alter the physical gaze vector used by FLAME/events.
+                screen_point = profile.screen_point(raw_pitch, raw_yaw)
+            else:
+                screen_point = angles_to_screen_point(
+                    raw_pitch, raw_yaw, mirror=args.mirror
+                )
             estimate = temporal.update(
                 pitch,
                 yaw,
@@ -321,24 +439,22 @@ def main() -> int:
                     detected_events.append(event)
                     print(f"event: {event['type']}")
 
+            overlay_info = (
+                mirrored_face_info(info, camera_frame.shape[1])
+                if args.mirror and info is not None
+                else info
+            )
             annotated = draw_overlay(
-                frame,
+                display_frame,
                 estimate.pitch,
                 estimate.yaw,
-                info,
+                overlay_info,
                 mirror=args.mirror,
                 temporal=estimate,
+                screen_point=screen_point,
             )
-            if calibration is not None and not calibration.finished:
-                annotated = draw_calibration_target(
-                    annotated,
-                    calibration.target,
-                    calibration.progress,
-                    label=f"CALIBRATION {calibration.index + 1}/{len(calibration.points)}",
-                )
-
             if face_count > 0:
-                last_gaze = estimate.gaze
+                last_gaze = gazetr_to_flame(estimate.gaze)
                 last_head_pose = estimate.head_pose
 
             if mirror is not None and last_gaze is not None:
@@ -371,7 +487,17 @@ def main() -> int:
 
             if not args.headless:
                 composed = compose_with_head(annotated, head_img)
-                cv2.imshow("GazeFlame", composed)
+                if calibration is not None and not calibration.finished:
+                    composed = draw_calibration_target(
+                        composed,
+                        calibration.target,
+                        calibration.progress,
+                        label=f"CALIBRATION {calibration.index + 1}/{len(calibration.points)}",
+                    )
+                composed = draw_screen_point(
+                    composed, estimate.screen_point if estimate.valid else None
+                )
+                cv2.imshow(WINDOW_TITLE, fit_to_display(composed, display_size))
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break

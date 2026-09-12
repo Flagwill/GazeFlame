@@ -5,29 +5,36 @@
 # 或（若环境已存在，仅更新依赖）:
 #   conda env update -f environment.yml
 #
-# 注意: FLAME_PyTorch 依赖较老, 使用 Python 3.8 以匹配其设计目标。
-# 若 pyrender==0.1.39 在安装时编译失败, 可放宽为 pyrender (最新版 API 兼容)。
+# 设计要点（2026-09-11 迁移）:
+#   * Python 3.10 + AMD TheRock 原生 gfx1035 torch（rocBLAS/MIOpen 自带 gfx1035
+#     kernel，无需 HSA_OVERRIDE；官方 ROCm 直到 10.0 都没有 gfx1035）。
+#   * FLAME_PyTorch 仍用老版本栈：numpy 1.23.5 + trimesh 3.6.18（np.bool 别名）
+#     + pyrender 0.1.39，这套在 py3.10 上同样可用。
+#   * torch 只能从 AMD TheRock nightly 索引装（见下方 pip `--index-url`）；
+#     TheRock 是 nightly，torch 版本会滚动（当前 2.14.0+rocm10.2.0a）。
+#   * dlib 用 conda-forge 预编译包（会顺带升级 numpy，随后 pip 再降回 1.23.5，
+#     两条顺序已按此排列；若 dlib 安装后 numpy 仍偏高，执行:
+#       pip install --force-reinstall numpy==1.23.5 --no-deps
+#   * 训练专用的 torchvision / pytorch-gradual-warmup-lr 未列入（推理流水线不用）。
+#
+# 已知限制: gfx1035 (Radeon 680M) 在持续 GPU 满载下仍会固件/驱动级挂死，
+# 见 AGENTS.md「原生 gfx1035 (TheRock) 实测」；占空比护栏必须保留。
 
-name: gaze_flame
+name: gaze_flame_rocm
 channels:
   - conda-forge
 
 dependencies:
-  - python=3.8
+  - python=3.10
   - pip
-  # dlib (人脸检测/对齐, ETH-XGaze 官方同款):
-  #   注意: conda-forge 的 dlib 会把 numpy 升到 1.24+, 而 trimesh 3.6.18 需要
-  #   numpy 1.23.5 (np.bool 等别名)。创建/更新环境后请务必执行:
-  #     pip install --force-reinstall numpy==1.23.5
   - dlib
   - pip:
-      # 版本说明:
-#   - numpy 1.23.5: 满足 torch 2.4.1 (需>=1.21) 且保留 np.bool 等别名 (1.24 移除),
-#     trimesh 3.6.18 依赖这些别名才能 import
-#   - torch 2.4.1: Python 3.8 可用, 无 NVIDIA GPU 时自动退化为 CPU 运行
+      # AMD TheRock 原生 gfx1035 构建（nightly index 为主，PyPI 兜底其余依赖）
+      - --index-url https://nightly.repo.amd.com/rocm/whl-next/
+      - --extra-index-url https://pypi.org/simple/
+      - torch[device-gfx1035]
+      # FLAME_PyTorch 运行时依赖（保持兼容的老版本）
       - numpy==1.23.5
-      - torch
-      - torchvision
       - pyrender==0.1.39
       - trimesh==3.6.18
       - smplx
@@ -35,4 +42,3 @@ dependencies:
       - matplotlib
       - PyYAML
       - easydict
-      - git+https://github.com/ildoonet/pytorch-gradual-warmup-lr.git

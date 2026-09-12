@@ -9,7 +9,7 @@
 #
 # 脚本会:
 #   1. 自动定位 conda (PATH 或 /opt/anaconda/bin)
-#   2. 直接使用 gaze_flame 环境的 python, 避免 shell activation 问题
+#   2. 直接使用 gaze_flame_rocm 环境的 python, 避免 shell activation 问题
 #   3. --device 透传给 run_gaze_to_flame.py (auto 时由 Python 端探测 GPU)
 
 set -euo pipefail
@@ -26,8 +26,8 @@ if [[ -z "${CONDA_BIN}" ]]; then
 fi
 
 # 从 conda env list 解析环境真实路径 (envs/ 可能在 ~/.conda/envs 或 $CONDA_ROOT/envs)
-# 兼容 active 标记在名称前 ("* gaze_flame ...") 或在行尾 ("gaze_flame ... *") 两种格式
-ENV_NAME="gaze_flame"
+# 兼容 active 标记在名称前 ("* NAME ...") 或在行尾 ("NAME ... *") 两种格式
+ENV_NAME="gaze_flame_rocm"
 ENV_PATH="$(awk -v n="${ENV_NAME}" '
   $1 == n {print $2; exit}
   $1 == "*" && $2 == n {print $3; exit}' <<< "$("${CONDA_BIN}" env list)")"

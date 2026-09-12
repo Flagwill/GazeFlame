@@ -1,298 +1,44 @@
 [
   {
     "type": "face_found",
-    "timestamp": 5304.713556945,
-    "frame": 1
+    "timestamp": 13852.431859022,
+    "frame": 3
   },
   {
     "type": "saccade_start",
-    "timestamp": 5305.014054198,
-    "velocity": 137.84085800037397,
+    "timestamp": 13852.532031162,
+    "velocity": 143.21765639780244,
     "frame": 4
   },
   {
     "type": "saccade_end",
-    "timestamp": 5305.11421364,
-    "velocity": 39.433707760693885,
+    "timestamp": 13852.632179207,
+    "velocity": 58.070651964060424,
     "frame": 5
   },
   {
-    "type": "fixation_start",
-    "timestamp": 5305.615041091,
-    "pitch": 0.5147842994865063,
-    "yaw": 0.6783608062050726,
+    "type": "saccade_start",
+    "timestamp": 13853.132753695,
+    "velocity": 108.12191567813623,
     "frame": 10
   },
   {
-    "type": "fixation_end",
-    "timestamp": 5305.715160303,
-    "duration": 0.30041693299972394,
-    "frame": 11
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5305.715160303,
-    "velocity": 146.63267701586292,
-    "frame": 11
-  },
-  {
     "type": "saccade_end",
-    "timestamp": 5306.11568653,
-    "velocity": 14.942139438560595,
-    "frame": 15
+    "timestamp": 13853.232841815,
+    "velocity": 43.57650981510911,
+    "frame": 11
   },
   {
-    "type": "saccade_start",
-    "timestamp": 5306.516303973,
-    "velocity": 239.01698175299143,
+    "type": "fixation_start",
+    "timestamp": 13854.0344462,
+    "pitch": -0.1408790951229438,
+    "yaw": -0.5150884630937672,
     "frame": 19
   },
   {
-    "type": "saccade_end",
-    "timestamp": 5306.916880698,
-    "velocity": 35.43033928263663,
-    "frame": 23
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5307.117190851,
-    "velocity": 108.27361626185191,
-    "frame": 25
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5307.217313555,
-    "velocity": 17.092792102468035,
-    "frame": 26
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5307.317437935,
-    "velocity": 213.11993360175768,
-    "frame": 27
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5308.419274282,
-    "velocity": 36.87447118351564,
-    "frame": 38
-  },
-  {
-    "type": "fixation_start",
-    "timestamp": 5309.120244821,
-    "pitch": 0.49027932493429893,
-    "yaw": 0.31025594779983734,
-    "frame": 45
-  },
-  {
     "type": "fixation_end",
-    "timestamp": 5309.220399164,
-    "duration": 0.30046058500010986,
-    "frame": 46
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5310.02145106,
-    "velocity": 192.21301068883741,
-    "frame": 54
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5310.522298697,
-    "velocity": 19.75670104652859,
-    "frame": 59
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5310.922793634,
-    "velocity": 380.60584820866546,
-    "frame": 63
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5311.523713338,
-    "velocity": 59.08598365764504,
-    "frame": 69
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5311.62383276,
-    "velocity": 328.11099282705896,
-    "frame": 70
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5311.724047099,
-    "velocity": 58.26731821221567,
-    "frame": 71
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5311.924330363,
-    "velocity": 113.96496080204258,
-    "frame": 73
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5312.224829083,
-    "velocity": 37.620782784034795,
-    "frame": 76
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5312.425102498,
-    "velocity": 138.71282496309163,
-    "frame": 78
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5312.825684252,
-    "velocity": 40.77450749481619,
-    "frame": 82
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5312.925797527,
-    "velocity": 120.61006241817789,
-    "frame": 83
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5313.025942511,
-    "velocity": 4.734215361814479,
-    "frame": 84
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5313.126066892,
-    "velocity": 103.99470534380812,
-    "frame": 85
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5313.32638822,
-    "velocity": 50.40635722956627,
-    "frame": 87
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5313.526698024,
-    "velocity": 163.05280362951393,
-    "frame": 89
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5313.727129706,
-    "velocity": 48.759934958480805,
-    "frame": 91
-  },
-  {
-    "type": "fixation_start",
-    "timestamp": 5314.027623537,
-    "pitch": 0.5225601951744028,
-    "yaw": 0.6413289282777541,
-    "frame": 94
-  },
-  {
-    "type": "fixation_end",
-    "timestamp": 5314.227922865,
-    "duration": 0.40064321600038966,
-    "frame": 96
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5314.227922865,
-    "velocity": 109.70509112392735,
-    "frame": 96
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5314.428236231,
-    "velocity": 15.460161924240834,
-    "frame": 98
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5315.630298093,
-    "velocity": 111.64431385239321,
-    "frame": 110
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5315.830663772,
-    "velocity": 63.69414998466609,
-    "frame": 112
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5316.932280601,
-    "velocity": 113.07942722802947,
-    "frame": 123
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5317.032380536,
-    "velocity": 44.49105034289367,
-    "frame": 124
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5317.533176,
-    "velocity": 141.61726485703875,
-    "frame": 129
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5317.633306527,
-    "velocity": 20.139254403734796,
-    "frame": 130
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5318.234247185,
-    "velocity": 254.85227878416015,
-    "frame": 136
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5318.734998298,
-    "velocity": 23.0547101830042,
-    "frame": 141
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5319.035440235,
-    "velocity": 120.0593822100748,
-    "frame": 144
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5319.536247713,
-    "velocity": 52.957207743034836,
-    "frame": 149
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5320.03697012,
-    "velocity": 148.84150071729294,
-    "frame": 154
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5320.137155195,
-    "velocity": 29.24606067660822,
-    "frame": 155
-  },
-  {
-    "type": "saccade_start",
-    "timestamp": 5320.738041026,
-    "velocity": 113.58784794321798,
-    "frame": 161
-  },
-  {
-    "type": "saccade_end",
-    "timestamp": 5320.838189013,
-    "velocity": 51.86493521683189,
-    "frame": 162
+    "timestamp": 13854.535499594,
+    "duration": 0.7013351650002733,
+    "frame": 24
   }
 ]

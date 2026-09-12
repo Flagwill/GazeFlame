@@ -31,7 +31,7 @@ GazeFlame/
 │   ├── viz.py               2D 视线标注 (draw_overlay, 摄像头/图片共用)
 │   ├── download_dlib_model.py 下载 dlib 68点模型 (需联网, 一次性)
 │   └── models/              dlib shape_predictor 模型 (gitignore)
-├── environment.yml          conda 环境定义 (name: gaze_flame)
+├── environment.yml          conda 环境定义 (name: gaze_flame_rocm)
 ├── run.sh                   一键运行脚本（自动定位 conda 环境）
 ├── run_gaze_to_flame.py     一键编排脚本 (GazeTR → FLAME, 统一单窗口)
 ├── run_webcam.py            实时摄像头/视频流视线追踪 (统一单窗口)
@@ -52,13 +52,18 @@ GazeFlame/
 ## 环境安装
 
 ```bash
-conda env create -f environment.yml      # 环境名 gaze_flame (Python 3.8)
-conda activate gaze_flame
-# dlib 会把 numpy 升到 1.24, 需降回 1.23.5 以兼容 trimesh:
-pip install --force-reinstall numpy==1.23.5
+conda env create -f environment.yml      # 环境名 gaze_flame_rocm (Python 3.10 + TheRock 原生 gfx1035)
+conda activate gaze_flame_rocm
+# 若 dlib 安装后 numpy 仍偏高，需降回 1.23.5 以兼容 trimesh:
+pip install --force-reinstall numpy==1.23.5 --no-deps
 # 下载 dlib 68 点人脸关键点模型 (~157MB, 解压后):
 python -m common.download_dlib_model
 ```
+
+环境用 AMD **TheRock** 原生 gfx1035 的 torch（`environment.yml` 里的
+`torch[device-gfx1035]`，来自 `https://nightly.repo.amd.com/rocm/whl-next/`），
+rocBLAS/MIOpen 自带 gfx1035 kernel，无需 `HSA_OVERRIDE_GFX_VERSION`。TheRock 是
+nightly，torch 版本会滚动。
 
 ## 使用
 
@@ -75,16 +80,19 @@ DEVICE=cuda ./run.sh                      # 有 GPU 时走 cuda
 
 统一窗口把**标注后的输入图**（视线箭头 + pitch/yaw 读数）和**跟随视线的 FLAME 头部**
 左右拼在同一个画面里（不再分别用控制台输出和独立的 pyrender 窗口）。
-默认弹出一个交互窗口（需 X11，按任意键关闭）；`--headless --save-image` 则直接存 PNG。
+默认弹出一个**全屏**交互窗口（需 X11，按任意键关闭），合成画面会用十字准星标出
+估计视点位置；`--windowed` 可恢复普通可调整大小的窗口，`--headless --save-image`
+则直接存 PNG。
 
 默认会对任意照片做**人脸检测 + ETH-XGaze 归一化对齐**：dlib 检出最大人脸 →
 68 点关键点 → solvePnP 头部姿态 → 透视 warp 成 224×224 标准正面裁剪，
-与 GazeTR 的训练分布一致（裸图不再被直接拉伸变形）。
+与 GazeTR 的训练分布一致（裸图不再被直接拉伸变形）；已经是 224×224 的标准
+GazeTR crop 会直接推理，避免重复 warp。
 
 ### 2. 只看 GazeTR 视线角度
 
 ```bash
-conda activate gaze_flame
+conda activate gaze_flame_rocm
 cd gazetr
 python inference.py --model model/GazeTR-H-ETH.pt --image images/inference/test.jpg --device cpu
 # --no-align          输入已是 224x224 裁剪图时跳过对齐
@@ -124,6 +132,7 @@ DEVICE=cuda ./run_webcam.sh             # 有 GPU 时用 cuda
 
 视频流默认使用 dlib correlation tracker 桥接短暂的运动模糊、遮挡或单帧检测失败，
 并按周期重新运行全图检测以校正漂移；完全离开画面后会自动清除旧跟踪并重新寻找人脸。
+自拍镜像只作用于显示，模型始终使用未镜像的摄像头帧。
 
 在 ROCm AMD 核显上，实时入口的 `auto` 默认使用 GPU，并启用占空比护栏，避免
 摄像头长时间运行时连续 HIP kernel 触发驱动卡死。默认相邻 forward 间隔至少
@@ -134,6 +143,23 @@ DEVICE=cuda ./run_webcam.sh             # 有 GPU 时用 cuda
 此外，启动时默认关闭 MIOpen 的 GCN 汇编卷积 kernel，避免 gfx1035 通过 ISA
 兼容模式运行数百次后触发 page fault；这仍是 GPU 推理，只是卷积速度会降低。
 稳定 AMD 独显可用 `GAZE_ROCM_SAFE_KERNELS=0` 恢复汇编 kernel。
+
+ROCm GPU 推理默认使用 fp16 autocast：GazeTR 的计算几乎全在 ResNet18 backbone，
+半精度实测单张约 1.3x、批量约 1.7x，角度漂移 <0.1°，同时缩短每帧 GPU 忙碌时间、
+降低核显持续负载。可用 `GAZE_ROCM_FP16=0` 回退 fp32；CPU/NVIDIA 路径不受影响。
+注意实时窗口的 fps 仍由上面的占空比护栏决定（约 10fps），fp16 主要让 GPU 更快
+空出来（更稳），批量/纯 GPU 场景的吞吐提升更明显。
+
+关于 GPU hang：经底层排查，旧版 torch 2.4.1+rocm6.1 捆绑的 rocBLAS 只有 gfx1030
+等内核，必须用 `HSA_OVERRIDE_GFX_VERSION=10.3.0` 伪装指令集，背靠背满载会触发
+`[gfxhub] page fault` → `MODE2 reset`。后来实测了 AMD **TheRock** 的原生 gfx1035
+构建（`gfx1035` 原生 rocBLAS/MIOpen、无需 override、数值正确、背靠背余量约 6x）：
+它消除了“坏地址”故障，但**持续 GPU 满载最终仍会挂死**（`Queue preemption failed →
+MODE2 reset`，与 kernel 集/精度无关，仅成倍延缓）——即这是 Radeon 680M APU 在持续
+满载下的固件/驱动级挂死，没有软件配置能根治。且每次故障后 GPU 会进入"无异常但慢
+几倍"的劣化态直到重启。因此占空比护栏是必要缓解，不能为了跑满帧率去掉。实时入口
+还会在 GPU 连续报错或健康探针发现前向远慢于基线时，自动切换到 CPU 继续会话。
+详见 `AGENTS.md` 的 "GPU Hang 根因排查" 与 "原生 gfx1035 (TheRock) 实测与迁移"。
 
 有窗口时，ROCm 实时入口还会默认把 HighGUI 的显示端切到软件光栅化，GazeTR
 仍然使用 GPU；如确认桌面/驱动稳定，可用 `GAZE_ROCM_SOFTWARE_DISPLAY=0` 恢复
@@ -147,6 +173,10 @@ DEVICE=cuda ./run_webcam.sh             # 有 GPU 时用 cuda
 ETH-XGaze 对齐 → GazeTR 推理（CPU 下本机实测约 **10fps**，受摄像头帧率上限约束）；
 加 `--flame` 后 FLAME 头部离屏渲染并按 `--head-fps`（默认 8）节流刷新，
 与标注后的画面合成到**同一个** `GazeFlame` 窗口，不拖慢主画面。
+
+视点十字准星默认按 pitch/yaw 的可视范围估算屏幕位置；加载
+`--calibration-file profiles/me.json` 后会使用九点校准得到的坐标，标记精度更高。
+校准只影响屏幕落点，不会改写 FLAME 的真实视线向量；RMSE 大于 0.15 的校准文件会被忽略，需重新校准。
 
 ### 实时增强
 

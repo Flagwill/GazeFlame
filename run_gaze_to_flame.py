@@ -29,7 +29,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from common.gpu import flame_render_device, prepare_amd_gpu_env, resolve_device
+from common.gpu import (
+    flame_render_device,
+    fp16_autocast_enabled,
+    prepare_amd_gpu_env,
+    resolve_device,
+)
 
 # 必须早于任何 import torch (ROCm: HSA 覆盖 + 抢注系统 libdrm)。
 prepare_amd_gpu_env()
@@ -37,7 +42,8 @@ prepare_amd_gpu_env()
 import cv2
 import numpy as np
 
-from common.geometry import gaze_to_dict, pitch_yaw_to_gaze
+from common.geometry import gazetr_to_flame, gaze_to_dict, pitch_yaw_to_gaze
+from common.calibration import angles_to_screen_point
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_GAZETR_ROOT = REPO_ROOT / "gazetr"
@@ -147,6 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headless", action="store_true",
                         help="Do not open an interactive window; render to a PNG "
                              "(requires --save-image)")
+    parser.add_argument("--windowed", action="store_true",
+                        help="keep the visualization window resizable instead of fullscreen")
     return parser
 
 
@@ -156,16 +164,24 @@ def show_or_save(
     save_image: str | None,
     headless: bool,
     window_title: str = "GazeFlame",
+    fullscreen: bool = True,
+    screen_point: "np.ndarray | tuple[float, float] | None" = None,
 ) -> None:
     """Compose the two panels and either save them or show a single window."""
     from common.flame_mirror import compose_with_head
 
+    from common.viz import draw_screen_point, fit_to_display
+
     composed = compose_with_head(annotated, head_img)
+    composed = draw_screen_point(composed, screen_point)
     if save_image:
         cv2.imwrite(str(save_image), composed)
         print(f"已保存合成图: {save_image}")
     if not headless:
-        cv2.imshow(window_title, composed)
+        from common.viz import create_display_window
+
+        display_size = create_display_window(window_title, fullscreen=fullscreen)
+        cv2.imshow(window_title, fit_to_display(composed, display_size))
         print("按任意键关闭窗口")
         cv2.waitKey(0)
         cv2.destroyAllWindows()
@@ -196,6 +212,8 @@ def main() -> None:
         print(f"推理设备: cuda ({backend}, {torch.cuda.get_device_name(0)})")
     else:
         print("推理设备: cpu")
+    if fp16_autocast_enabled(device):
+        print("提示: 已启用 fp16 autocast 推理 (约 1.3-1.7x; GAZE_ROCM_FP16=0 关闭)")
 
     with tempfile.TemporaryDirectory(prefix="gazetr_") as temp_dir:
         result_file = Path(temp_dir) / "results.json"
@@ -229,12 +247,18 @@ def main() -> None:
         result = read_gaze_result(result_file)
         pitch, yaw = result["pitch"], result["yaw"]
         gaze = pitch_yaw_to_gaze(pitch, yaw)
+        flame_gaze = gazetr_to_flame(gaze)
         gaze_dict = gaze_to_dict(gaze)
 
         print(f"\nPitch: {pitch:.6f} rad, Yaw: {yaw:.6f} rad")
         print(
             f"Gaze vector: x={gaze_dict['x']:.6f}, "
             f"y={gaze_dict['y']:.6f}, z={gaze_dict['z']:.6f}"
+        )
+        flame_dict = gaze_to_dict(flame_gaze)
+        print(
+            f"FLAME vector: x={flame_dict['x']:.6f}, "
+            f"y={flame_dict['y']:.6f}, z={flame_dict['z']:.6f}"
         )
 
         if args.skip_viewer:
@@ -255,21 +279,24 @@ def main() -> None:
             # The batch inference result intentionally stays JSON-friendly;
             # recover the alignment metadata here for pose/blink-aware FLAME
             # rendering and the richer overlay.
-            from common.face import align_face_to_gaze_crop
+            from common.face import align_face_to_gaze_crop, is_gazetr_crop
 
-            try:
-                _, face_info = align_face_to_gaze_crop(bgr)
-                if face_info.get("face_count", 0) == 0:
-                    face_info = None
-            except Exception as exc:
-                print(f"提示: 无法恢复头姿态信息 ({exc})")
+            if not is_gazetr_crop(bgr):
+                try:
+                    _, face_info = align_face_to_gaze_crop(bgr)
+                    if face_info.get("face_count", 0) == 0:
+                        face_info = None
+                except Exception as exc:
+                    print(f"提示: 无法恢复头姿态信息 ({exc})")
         panel = scale_to_width(bgr, args.display_width // 2)
+        screen_point = angles_to_screen_point(pitch, yaw)
         annotated = draw_overlay(
             panel,
             pitch,
             yaw,
             info=face_info,
             show_face=face_info is not None,
+            screen_point=screen_point,
         )
 
         mirror = FlameMirror(
@@ -278,14 +305,21 @@ def main() -> None:
         )
         try:
             head_img = mirror.render(
-                gaze,
+                flame_gaze,
                 head_pose=face_info.get("head_pose") if face_info else None,
                 blink=0.0 if face_info is None else float(
                     np.clip((0.28 - face_info.get("eye_aspect_ratio", 0.28)) / 0.10, 0.0, 1.0)
                 ),
             )
             print(f"[GazeTR→FLAME] FLAME 渲染阶段耗时 {time.perf_counter() - t_flame:.2f}s")
-            show_or_save(annotated, head_img, save_image, args.headless)
+            show_or_save(
+                annotated,
+                head_img,
+                save_image,
+                args.headless,
+                fullscreen=not args.windowed,
+                screen_point=screen_point,
+            )
         finally:
             mirror.close()
         print(f"[GazeTR→FLAME] 总耗时 {time.perf_counter() - t_pipeline:.2f}s")

@@ -21,17 +21,22 @@ GazeTR（Transformer 视线估计）× FLAME_PyTorch（3D 头部参数模型）�
 
 ## 环境
 
-- conda 环境名：`gaze_flame`，Python **3.8**（FLAME_PyTorch 依赖较老）
-- 关键版本锁定（勿随意升级）：numpy==1.23.5（trimesh 3.6.18 需要 np.bool 等旧别名）、pyrender==0.1.39、trimesh==3.6.18
-- dlib 19.24.2（conda-forge）：**conda 安装 dlib 会把 numpy 升到 1.24.4**，
-  必须再执行 `pip install --force-reinstall numpy==1.23.5` 降回，否则 trimesh import 报
-  `AttributeError: module 'numpy' has no attribute 'bool'`（这是已知坑，已验证）
-- 创建/更新环境：`conda env create -f environment.yml`（环境更新后记得上面的 numpy 降级 + 下载 dlib 模型）
+- conda 环境名：`gaze_flame_rocm`，Python **3.10** + AMD **TheRock 原生 gfx1035**
+  torch（rocBLAS/MIOpen 自带 gfx1035 kernel，无需 `HSA_OVERRIDE`；2026-09-11 从旧的
+  Python 3.8 + torch 2.4.1+rocm6.1 环境迁移而来，旧 `gaze_flame` 环境已删除）
+- 关键版本锁定（勿随意升级）：numpy==1.23.5（trimesh 3.6.18 需要 np.bool 等旧别名）、
+  pyrender==0.1.39、trimesh==3.6.18；这套老栈在 Python 3.10 上同样可用（已验证）
+- dlib 19.24.2（conda-forge）：**conda 安装 dlib 会把 numpy 升到 1.24+**，
+  `environment.yml` 已把 pip 的 numpy==1.23.5 排在 dlib 之后；若 import trimesh 报
+  `AttributeError: module 'numpy' has no attribute 'bool'`，执行
+  `pip install --force-reinstall numpy==1.23.5 --no-deps` 降回（已知坑）
+- 创建/更新环境：`conda env create -f environment.yml`（含 TheRock nightly 索引；
+  环境更新后记得 numpy 降级 + 下载 dlib 模型）
 
 ## 运行方式
 
 ```bash
-# 一键脚本 (自动定位 conda + gaze_flame 环境, 无需手动 activate; 默认 CPU)
+# 一键脚本 (自动定位 conda + gaze_flame_rocm 环境, 无需手动 activate; 默认 CPU)
 ./run.sh                                  # 默认示例图片 test.jpg (统一单窗口)
 ./run.sh --image /path/to/face.jpg        # 自定义图片
 ./run.sh --skip-viewer                    # 只算角度, 不显示窗口
@@ -39,7 +44,7 @@ GazeTR（Transformer 视线估计）× FLAME_PyTorch（3D 头部参数模型）�
 DEVICE=cuda ./run.sh                      # 有 GPU 时走 cuda (无 GPU 自动回退 cpu)
 
 # 或手动方式:
-conda activate gaze_flame
+conda activate gaze_flame_rocm
 python run_gaze_to_flame.py --image gazetr/images/inference/test.jpg --device cpu
 
 # 仅 GazeTR 推理
@@ -89,21 +94,21 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
   `run_webcam.py --flame --headless --save-frames` 逐帧存标注图 + head/ 节流帧，均正常。
   注意：pyrender **OffscreenRenderer 仍需可用 GL 上下文**（本机 `DISPLAY=:1`）；
   `DISPLAY=`（空）会让其创建失败并报 Pyglet NoSuchDisplayException——这不是代码问题。
-- **AMD GPU (ROCm) 已启用（2026-09-10 重启后复测，带占空比护栏）**：
-  本机 Radeon 680M = gfx1035，装 torch 2.4.1+rocm6.1（cp38 wheel，官方索引或
-  上交镜像 mirror.sjtu.edu.cn/pytorch-wheels/rocm6.1/），需
-  `HSA_OVERRIDE_GFX_VERSION=10.3.0`（common/gpu.py 自动设）。前向 batch=1 约
-  5ms、batch=16 约 35ms。**坑（关键）**：核显与显示共享内存，**背靠背满载**
-  forward 到 ~300 次(b1)/60-120 次(b16) 必现 GPU Hang + amdgpu MODE2 reset
-  （`HSA_ENABLE_SDMA=0`、禁用 fused SDPA 均无效；挂死后重启才恢复）。
-  **对策 = 占空比护栏 + 兼容 kernel**：`common/gpu.py:rocm_igpu_guard(device,
-  elapsed)` 把相邻两次 GPU forward 的间隔补足到 `ROCM_SAFE_INTERVAL`(默认 100ms)，
-  并由 `prepare_amd_gpu_env` 默认设置 `MIOPEN_DEBUG_GCN_ASM_KERNELS=0`，避免
-  gfx1035 的 GCN 汇编 kernel 在长时间重复 forward 后 page fault。通用 HIP kernel
-  仍然使用 GPU；实测兼容模式下 220 帧无窗口实时流水线完整通过。稳定 AMD 独显可用
-  `GAZE_ROCM_SAFE_KERNELS=0` 恢复汇编 kernel，再按需用 `GAZE_ROCM_SAFE_MODE=0`
-  关闭占空比护栏。快速视频回放 / 大批量文件夹仍会被限速到约 6fps 以保安全。
-  单张图 run.sh 仍默认 cpu（GPU 上下文初始化多花 ~1.5s，单图不划算；
+- **AMD GPU (ROCm, TheRock 原生 gfx1035，2026-09-11 迁移）**：
+  本机 Radeon 680M = gfx1035，现用 TheRock 原生构建（`amd-torch-device-gfx1035`，
+  当前 torch 2.14.0+rocm10.2.0a / HIP 7.16；见 environment.yml 与本文「原生 gfx1035
+  (TheRock) 实测」）。**无需 `HSA_OVERRIDE`**（旧式官方 ROCm 才需，显式设
+  `GAZE_ROCM_GFX_OVERRIDE=10.3.0` 复现）。前向 batch=1 约 4.8ms、batch=16 约 36ms。
+  **坑（关键）**：核显与显示共享内存，**背靠背满载** forward 到 ~2000 次(b1) 必现
+  GPU Hang + amdgpu MODE2 reset（旧 build 是 ~300 且伴 page fault；`HSA_ENABLE_SDMA=0`、
+  禁用 fused SDPA 均无效；挂死后重启才恢复）。
+  **对策 = 占空比护栏**：`common/gpu.py:rocm_igpu_guard(device, elapsed)` 把相邻两次
+  GPU forward 的间隔补足到 `ROCM_SAFE_INTERVAL`(默认 100ms)，实测可稳定数千帧。
+  只有走 ISA 伪装（`GAZE_ROCM_GFX_OVERRIDE`）时才默认设
+  `MIOPEN_DEBUG_GCN_ASM_KERNELS=0`；native gfx1035 保留 ASM kernel（更快，非 ASM
+  只把挂死从 ~3650 延到 ~5850，治标不治本）。稳定 AMD 独显可用
+  `GAZE_ROCM_SAFE_MODE=0` 关闭占空比护栏。快速视频回放 / 大批量文件夹仍会被限速到
+  约 6fps 以保安全。单张图 run.sh 仍默认 cpu（GPU 上下文初始化多花 ~1.5s，单图不划算；
   DEVICE=cuda 显式开启则走 GPU）。
   **第二个坑（2026-09-10 夜修复）：HIP 与持续 OpenGL 渲染互斥**。`run_webcam
   --flame` 有人脸时 pyrender 每帧做 GL 渲染（光栅化在同一块核显的 3D 引擎上），
@@ -125,12 +130,109 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
   CPU 首帧亦稳定）。当前分段耗时：GazeTR 阶段 ~1.8s（torch import 1.0s +
   dlib 模型 0.65s + 其余），FLAME 阶段 ~1.0s；模型前向本身仅 13ms（300 帧
   持续压测 median 13.0 / max 15.1ms，无劣化）。
+- **fp16 autocast GPU 推理（2026-09-11，ROCm 默认开启）**：GazeTR 的耗时几乎全在
+  ResNet18 backbone（b1 前向 ~8ms 中 transformer encoder 仅 ~2ms；逐层 profiling
+  见下），fp16 autocast 实测 b1 **1.3x** / b16 **1.7x**，ETH-XGaze 样例角度漂移
+  <0.1°（pitch/yaw 各 ~0.001 rad）。默认在 ROCm 构建开启，`GAZE_ROCM_FP16=0`
+  关闭；CPU/NVIDIA 不受影响。**重要认知**：核显实时路径的墙钟 fps 仍被 100ms
+  占空比护栏钉在 ~10fps，fp16 的收益是**每帧 GPU 忙碌时间缩短**（b1 8→5ms、
+  b16 100→60ms，持续负载更低、更远离 Hang）以及在护栏不生效场景（独显 /
+  `GAZE_ROCM_SAFE_MODE=0` / 纯 GPU-bound 批处理）的吞吐提升，而不是实时 fps。
+  切勿因此调大 `--batch_size`：b32+ 实测更慢，且无护栏背靠背大 batch 已复现
+  `Memory access fault`（护栏必须保留）。
+- **推理健壮性（2026-09-11）**：`predict_gaze` / 批量推理拦截非有限输出
+  （静默 NaN 劣化态按丢脸 / 跳过该图处理，不再把 NaN 传进 UI）；`run_webcam`
+  若 GPU 连续 3 帧抛 HIP/CUDA 运行时错误，会自动把模型重载到 CPU 继续会话
+  （死掉的 HIP 上下文无法进程内恢复；`common.gpu.is_gpu_runtime_error` 判别）。
+
+## GPU Hang 根因排查（2026-09-11，旧 build ROCm 6.1 / gfx1035）
+
+用户怀疑"GPU hang 不正常"。旧环境排查结论：**这是 ROCm 6.1 对 Radeon 680M
+(gfx1035) 不支持的后果，不是本项目代码的 bug，也无法靠改 Python 代码根治。**
+（后续用原生 TheRock 复测，发现还有更深一层原因，见下节。）
+
+证据链：
+- 内核 7.2.3-arch，amdgpu 驱动；torch 2.4.1+rocm6.1 是 Python 3.8 可用的最后一版。
+- 随 torch 捆绑的 rocBLAS Tensile kernel 只有 gfx1030 / gfx1100 / gfx900 / gfx906 /
+  gfx908 / gfx90a / gfx942，**没有 gfx1035**；MIOpen 3.1.0 与 hipBLASLt 同样没有。
+  只能 `HSA_OVERRIDE_GFX_VERSION=10.3.0` 把 gfx1030 预编译二进制跑在 gfx1035 上；
+  `torch.cuda.get_device_properties(0).gcnArchName` 实际报 `gfx1030`。
+- 复现：无间隔背靠背 forward，约 20s–5min 内必现 GPU 页错误；内核日志签名固定：
+  ```
+  amdgpu ...: [gfxhub] page fault (src_id:0 ring:24 ...)
+  amdgpu ...: GCVM_L2_PROTECTION_FAULT_STATUS:0x00801031
+  amdgpu ...:   Faulty UTCL2 client ID: TCP (0x8)
+  amdgpu ...:   PERMISSION_FAULTS: 0x3       # 访问了未映射的 GPU VA
+  amdgpu ...: GPU reset begin!. Source: 4    # VM 层触发
+  amdgpu ...: MODE2 reset
+  amdgpu ...: [drm] device wedged, but no recovery needed
+  ```
+- 内存无泄漏（allocated/reserved 恒定），温度 ~80°C 不是热保护；故障地址在进程
+  VA 空间里跳变 → gfx1030 内核在 gfx1035 APU 上算出了错误的地址（APU 的 GTT/
+  carve-out 地址布局与 dGPU 不同）。
+- 故障是**概率性**的：空闲间隔越长概率越低，但 20ms 空闲仍约 5min 复现；
+  `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` 在本 build 直接
+  "not supported on this platform" 被忽略。所以 100ms 占空比护栏是**降低概率**
+  而非根治（这也解释了为什么它当初有效、却不能宣称"安全"）。
+- **关键副作用：每次 fault 后 GPU 进入静默劣化态**（实测 batch16 前向
+  105ms→705ms、batch1 ~8→20ms），不会自愈，需复位/重启。所以宁可多留空闲、
+  避免 fault，也不要为了 fps 去掉护栏。
+
+处置：
+- **不要移除 `common.gpu.rocm_igpu_guard` 占空比护栏**，它是目前最有效的缓解；
+  想更保守可调大 `GAZE_ROCM_SAFE_INTERVAL`。
+- `run_webcam` 在 GPU 连续 3 帧报 HIP/CUDA 错误、或健康探针连续两次发现前向
+  时间 > `max(6×基线, 基线+100ms)` 时，会把模型重载到 CPU 继续会话
+  （`fallback_to_cpu`）。硬 fault（SIGABRT）进程仍会被杀，完全兜底需要外层
+  supervisor 重启。
+- 根治路径（优先级）：① 换 ROCm 官方支持的 GPU；② 带 gfx1035 原生支持的
+  ROCm 构建（已实测 = TheRock，见下节：能去掉 override/坏地址故障，但**不能**消除
+  持续满载挂死，仍需护栏）；③ 纯 CPU（GazeTR CPU 前向 ~12ms，实时 10fps 足够）；
+  ④ 维持现状：护栏 + fp16 + 自动降级。
+
+## 原生 gfx1035 (TheRock) 实测与迁移（2026-09-11，最终结论）
+
+官方 ROCm（直到文档中的 10.0）始终没有 gfx1035 的 rocBLAS/MIOpen kernel；但 AMD
+新的 **TheRock** 构建按 gfx 架构发布原生 wheel，gfx1035 在支持列表里。**项目已迁移
+到该构建**（conda 环境 `gaze_flame_rocm`，Python 3.10；见 environment.yml）：
+
+```bash
+pip install --index-url https://nightly.repo.amd.com/rocm/whl-next/ "torch[device-gfx1035]"
+```
+
+实测（torch 2.14.0+rocm10.2.0a，HIP 报 7.16）：`gcnArchName=gfx1035`（**无需**
+`HSA_OVERRIDE_GFX_VERSION`），`get_arch_list()` 含 gfx1035，捆绑 rocBLAS 的 Tensile
+**只有 gfx1035**、MIOpen 有 gfx1035 kpack。数值正确：fp32 GPU vs CPU 最大差 2.7e-6、
+fp16 8.7e-4；b1 ~4.8ms、b16 ~36ms。
+
+**但它不能解决持续满载挂死。** 背靠背（无护栏）压测阈值：
+
+| 工作负载（native gfx1035） | 挂死迭代 | 故障 |
+|---|---|---|
+| 整个 GazeTR 模型 b1 fp32 | ~2000 | 无 page fault，`Queue preemption failed → MODE2 reset` |
+| 仅 ResNet18 卷积栈 fp32 + MIOpen ASM | ~3650 | 同上 |
+| 仅卷积栈 fp32 + `MIOPEN_DEBUG_GCN_ASM_KERNELS=0` | ~5850 | 同上 |
+| 仅卷积栈 fp16 + 非 ASM | ~10350 | 同上 |
+
+对比旧 build（rocBLAS gfx1030 伪装）~300 次且伴 `[gfxhub] page fault`：native 消除了
+ISA 不匹配与“坏地址”故障，余量约 6x；但换 kernel 集（非 ASM）/降精度只**成倍延缓**
+挂死，无法根除，触发点是 MIOpen 卷积栈。结论：**这是 Radeon 680M APU 在持续 GPU
+满载下的固件/驱动级挂死，任何 ROCm 版本/内核配置都只是降低概率**。挂死后 GPU 进入
+静默劣化态（b1 5ms→20ms），MODE2 复位不恢复，需重启。
+
+影响：**占空比护栏继续保留**（native 也救不了）。native 把背靠背余量从旧 build 的
+~300 拉到 ~2000（~6x），再叠加非 ASM + fp16 可到 ~10350（~2.8x）；理论上可把
+`GAZE_ROCM_SAFE_INTERVAL` 调小于 100ms 换取更高实时 fps，但默认仍用 100ms 保守值。
+迁移已完成：Python 3.10 + TheRock，numpy 1.23.5 / trimesh 3.6.18 / pyrender 0.1.39
+老 pins 在 cp310 可用；旧 `gaze_flame`（Py3.8）与 `.venv_rocm1035` 实验环境已删除。
+复现脚本在 `~/.cache/gazeflame_gfx1035/`（不在仓库，已指向新环境 `gaze_flame_rocm`）。
 
 ## Agent 注意事项
 
-- 本机 GPU：Radeon 680M 核显（gfx1035，torch 已装 2.4.1+rocm6.1，`cuda` 即 ROCm）。
+- 本机 GPU：Radeon 680M 核显（gfx1035，TheRock 原生 torch 2.14+rocm10.2，`cuda` 即 ROCm）。
   可安全用于实时/批量推理，**但必须保留 `rocm_igpu_guard` 占空比护栏**（背靠背
-  满载会 GPU Hang，见上文）；**`--flame` 实时模式必须经 `flame_realtime_device`
+  满载会 GPU Hang，见上文；TheRock 原生 gfx1035 也一样，别以为换个 build 就能去掉）；
+  **`--flame` 实时模式必须经 `flame_realtime_device`
   回退 cpu**（HIP 与持续 GL 渲染共载必挂）；单张图 run.sh 默认仍 cpu（GPU 初始化不划算）
 - 交互式窗口（`run_gaze_to_flame` 的 cv2 窗口 / `run_webcam` / `gaze_viewer` 的
   pyrender.Viewer）都是阻塞式 GUI：自动化验证请用 `--headless --save-image`（或
@@ -139,9 +241,10 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
 - 设备选择统一走 `common/gpu.py`：`resolve_device("auto"/"cuda")` 用**真实 kernel
   探测**（ROCm 对不支持芯片 `is_available()` 会误报 True，kernel 才报错，勿改回）；
   `prepare_amd_gpu_env()` 必须在任何 `import torch` 之前调用（所有入口脚本头部已
-  接好）：设 `HSA_OVERRIDE_GFX_VERSION=10.3.0` + 抢注系统 libdrm——ROCm 版 torch
-  会连带 import 旧 libdrm 破坏 pyrender 的 GLX（NoSuchConfigException），换回
-  CPU/CUDA 构建后此调用无副作用
+  接好）：仅在显式设 `GAZE_ROCM_GFX_OVERRIDE=10.3.0`（旧式无 gfx1035 kernel 的官方
+  ROCm）时才设 HSA override + 禁用 MIOpen 汇编 kernel；当前 native gfx1035 默认不设
+  override，只抢注系统 libdrm——ROCm 版 torch 会连带 import 旧 libdrm 破坏 pyrender 的
+  GLX（NoSuchConfigException），换回 CPU/CUDA 构建后此调用无副作用
 - `run_gaze_to_flame.py`：GazeTR 推理默认**进程内**（sys.path 加 gazetr/ 后
   import model/inference，与 run_webcam 同款）；`--subprocess` 保留旧
   subprocess + JSON 临时文件链路作回退。FLAME 头部进程内 `FlameMirror` 离屏渲染，
@@ -167,9 +270,12 @@ cd flame && python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
   护栏；可用 `GAZE_ROCM_SAFE_INTERVAL=0.20` 增加余量，稳定 AMD 独显可用
   `GAZE_ROCM_SAFE_MODE=0` 关闭护栏。`--flame` 仍按 `flame_realtime_device` 回退
   cpu，以避免 HIP 与持续 GL 渲染共载，不受该护栏影响。
-- 由于当前环境的 gfx1035 需要 ISA override，实时入口默认禁用 MIOpen GCN 汇编
-  kernel（`MIOPEN_DEBUG_GCN_ASM_KERNELS=0`），仍是 GPU 推理；稳定 AMD 独显可用
-  `GAZE_ROCM_SAFE_KERNELS=0` 恢复。
+- native gfx1035 默认保留 MIOpen GCN 汇编卷积 kernel（`MIOPEN_DEBUG_GCN_ASM_KERNELS`
+  不设，更快）；只有旧式 ISA override 模式才默认禁用（`GAZE_ROCM_SAFE_KERNELS=0`
+  关闭该禁用）。两种都仍需占空比护栏。
+- ROCm GPU 推理默认走 fp16 autocast（`common.gpu.autocast_gpu`，约 1.3-1.7x，
+  见上），`GAZE_ROCM_FP16=0` 可回退 fp32；仅 ROCm 构建生效，CPU/NVIDIA 不受影响。
+  前向与 `run_webcam` 的 warmup 都走同一精度，避免首帧 kernel 重编译。
 - ROCm 核显的实时 GUI 默认由 `prepare_rocm_display_env` 设置 HighGUI/Qt 使用
   XCB + 软件光栅化（`LIBGL_ALWAYS_SOFTWARE=1`），而 GazeTR 仍运行在 GPU；这是
   为隔离桌面合成与 HIP 负载。确认稳定桌面后可设 `GAZE_ROCM_SOFTWARE_DISPLAY=0`

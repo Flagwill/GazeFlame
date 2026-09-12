@@ -38,6 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # 必须早于 import torch (ROCm: HSA 覆盖 + 抢注系统 libdrm; CPU/CUDA build 无副作用)。
 from common.gpu import (  # noqa: E402
+    autocast_gpu,
+    fp16_autocast_enabled,
     prepare_amd_gpu_env,
     resolve_device,
     rocm_igpu_guard,
@@ -51,7 +53,11 @@ import numpy as np
 import torch
 
 import model
-from common.face import align_face_to_gaze_crop, draw_aligned_overlay
+from common.face import (
+    align_face_to_gaze_crop,
+    draw_aligned_overlay,
+    is_gazetr_crop,
+)
 from gtools import gazeto3d
 
 # Supported input image extensions (upper/lower case).
@@ -140,10 +146,11 @@ def prepare_input_image(
     """Return ``(img_bgr, face_count)``, aligning the face when requested.
 
     Runs ETH-XGaze face detection + normalization (``common.face``) so GazeTR
-    sees a training-like normalized crop.  Falls back to the raw image (naive
-    resize) when no face is found or dlib fails.
+    sees a training-like normalized crop.  Existing 224x224 inputs are treated
+    as canonical crops and are left unchanged.  Falls back to the raw image
+    (naive resize) when no face is found or dlib fails.
     """
-    if not align:
+    if not align or is_gazetr_crop(img_bgr):
         return img_bgr, 0
     try:
         crop, info = align_face_to_gaze_crop(img_bgr)
@@ -173,12 +180,13 @@ def predict_gaze(
     Returns ``(pitch, yaw, face_count, prep_bgr, info)`` where ``prep_bgr`` is
     the crop actually fed to the model and ``info`` is the alignment dict from
     ``common.face`` (contains ``rect``/``landmarks6`` for overlays, or None).
-    Falls back to the raw image when no face is found or alignment fails.
+    Existing 224x224 inputs are treated as canonical crops.  Falls back to the
+    raw image when no face is found or alignment fails.
     """
     info: dict | None = None
     prep_bgr = img_bgr
     face_count = 0
-    if align:
+    if align and not is_gazetr_crop(img_bgr):
         try:
             crop, info = align_face_to_gaze_crop(
                 img_bgr, face_tracker=face_tracker
@@ -192,12 +200,19 @@ def predict_gaze(
             info = None
 
     tensor = preprocess_image(prep_bgr, device)
-    with torch.inference_mode():
+    # fp16 autocast on ROCm (no-op elsewhere); the transformer tail is
+    # negligible either way, the ResNet backbone is the whole win.
+    with torch.inference_mode(), autocast_gpu(device):
         gaze = net({"face": tensor})
     # The duty-cycle guard needs a real kernel-completion boundary.  A later
     # tensor copy usually synchronizes too, but relying on that is backend-specific.
     synchronize_device(device)
-    gaze = gaze.cpu().numpy()[0]
+    gaze = gaze.float().cpu().numpy()[0]
+    if not np.all(np.isfinite(gaze)):
+        # A hung / degraded ROCm context can silently return NaN instead of
+        # faulting (documented in AGENTS.md).  Surface it as "no face" so the
+        # temporal filter and the live loop never propagate NaN into the UI.
+        return 0.0, 0.0, 0, prep_bgr, None
     return float(gaze[0]), float(gaze[1]), int(face_count), prep_bgr, info
 
 
@@ -365,14 +380,19 @@ def inference(
                 for _, _, (prep_bgr, _) in prepared
             ]
             inputs = torch.stack(cpu_inputs, dim=0).to(device, non_blocking=True)
-            gaze_pred = net({"face": inputs})
+            with autocast_gpu(device):
+                gaze_pred = net({"face": inputs})
             synchronize_device(device)
-            gaze_pred = gaze_pred.cpu().numpy()
+            gaze_pred = gaze_pred.float().cpu().numpy()
             # gfx1035 核显护栏: 大批量文件夹背靠背 forward 会 GPU Hang,
             # 把相邻批间隔补足到安全占空比 (CPU/CUDA/独显不受影响, 见 common/gpu.py)。
             rocm_igpu_guard(device, time.perf_counter() - batch_t0)
 
             for (image_path, bgr, (_, face_count)), gaze in zip(prepared, gaze_pred):
+                if not np.all(np.isfinite(gaze)):
+                    print(f"[{Path(image_path).name}] 警告: 模型输出非有限值 "
+                          "(可能的 GPU 劣化)，跳过该图")
+                    continue
                 processed += 1
                 pitch, yaw = float(gaze[0]), float(gaze[1])
                 result = {
@@ -521,6 +541,8 @@ def main() -> int:
         if getattr(_t.version, "hip", None):
             print(f"使用 ROCm GPU: {_t.cuda.get_device_name(0)}")
     device = torch.device(args.device)
+    if fp16_autocast_enabled(device):
+        print("提示: 已启用 fp16 autocast 推理 (约 1.3-1.7x; GAZE_ROCM_FP16=0 关闭)")
 
     print("=" * 70)
     print("GazeTR Inference - Gaze Estimation with Transformer")

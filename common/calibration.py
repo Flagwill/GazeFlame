@@ -13,6 +13,30 @@ import numpy as np
 DEFAULT_CALIBRATION_POINTS = tuple(
     (x, y) for y in (0.15, 0.5, 0.85) for x in (0.15, 0.5, 0.85)
 )
+MAX_USABLE_RMSE = 0.15
+
+
+def angles_to_screen_point(
+    pitch: float,
+    yaw: float,
+    max_pitch_deg: float = 30.0,
+    max_yaw_deg: float = 40.0,
+    mirror: bool = False,
+) -> np.ndarray:
+    """Map model angles to a clipped, normalized screen point.
+
+    This is the uncalibrated fallback used to keep the gaze position visible.
+    A ``CalibrationProfile`` remains the preferred mapping when one is
+    available.
+    """
+    pitch_limit = max(np.radians(float(max_pitch_deg)), 1e-6)
+    yaw_limit = max(np.radians(float(max_yaw_deg)), 1e-6)
+    point = np.array(
+        [0.5 + (1.0 if mirror else -1.0) * float(yaw) / (2.0 * yaw_limit),
+         0.5 - float(pitch) / (2.0 * pitch_limit)],
+        dtype=np.float64,
+    )
+    return np.clip(point, 0.0, 1.0)
 
 
 @dataclass
@@ -23,6 +47,14 @@ class CalibrationProfile:
     max_pitch_deg: float = 30.0
     max_yaw_deg: float = 40.0
     rmse: float = 0.0
+
+    def is_usable(self, max_rmse: float = MAX_USABLE_RMSE) -> bool:
+        """Return whether this profile is finite and fit well enough to use."""
+        return bool(
+            np.all(np.isfinite(self.matrix))
+            and np.isfinite(self.rmse)
+            and 0.0 <= self.rmse <= float(max_rmse)
+        )
 
     def screen_point(self, pitch: float, yaw: float) -> np.ndarray:
         feature = np.array([float(pitch), float(yaw), 1.0], dtype=np.float64)

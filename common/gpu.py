@@ -1,9 +1,10 @@
 """ROCm/GPU 设备支持辅助（AMD 独显/核显走 PyTorch HIP 后端）。
 
-本机 Radeon 680M 是 gfx1035，不在 ROCm 官方支持列表里：必须设置
-``HSA_OVERRIDE_GFX_VERSION=10.3.0`` 让运行时加载 gfx1030 的 kernel，
-否则 ``torch.cuda.is_available()`` 仍返回 True，但任何 kernel 一执行就报
-``HIP error: invalid device function``（这是最大的坑，勿删这个探测）。
+本机 Radeon 680M 是 gfx1035。当前项目环境（TheRock 原生 gfx1035 构建）的
+rocBLAS/MIOpen 自带 gfx1035 kernel，**不需要** ISA 伪装即可直接运行。旧的
+官方 ROCm（无 gfx1035 kernel）才需要 ``HSA_OVERRIDE_GFX_VERSION=10.3.0`` 把
+gfx1030 预编译二进制跑在 gfx1035 上；该兼容模式现在改为显式开关
+``GAZE_ROCM_GFX_OVERRIDE=10.3.0``，默认关闭。
 
 PyTorch 的 ROCm build 完全复用 ``cuda`` 这套 API 名字：设备字符串就是
 ``"cuda"``，不需要写 ``"hip"``。
@@ -19,9 +20,13 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import contextmanager
 from functools import lru_cache
 
-# gfx1035 (Radeon 680M) 等 RDNA2 非官方支持芯片的 ISA 覆盖值。
+# 旧式官方 ROCm（无 gfx1035 kernel）兼容模式的显式开关：设
+# ``GAZE_ROCM_GFX_OVERRIDE=10.3.0`` 才启用 gfx1030 ISA 伪装。默认不设 ——
+# 当前环境是 TheRock 原生 gfx1035，伪装反而会退化成出错的旧路径。
+GFX_OVERRIDE_ENV = "GAZE_ROCM_GFX_OVERRIDE"
 GFX_OVERRIDE_DEFAULT = "10.3.0"
 
 # gfx1035 核显安全占空比（秒）。实测：背靠背满载 ~300-400 次 forward 必现
@@ -71,20 +76,22 @@ def preload_system_libdrm() -> None:
 def prepare_amd_gpu_env() -> None:
     """ROCm 混合环境（GPU 推理 + pyrender）必须在 ``import torch`` 之前调用。
 
-    做三件事：
-      1. ``os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")`` —
-         gfx1035 等非官方芯片否则任何 kernel 都报 invalid device function；
-      2. 抢注系统 libdrm — 否则 torch/lib 的旧 libdrm 破坏 pyrender 的 GLX。
-      3. 关闭 MIOpen GCN 汇编卷积 — gfx1035 借助 ISA override 运行汇编 kernel
-         会在长时间重复 forward 后触发 amdgpu page fault；通用 HIP kernel
-         仍然运行在 GPU 上。
+    做两件事：
+      1. 抢注系统 libdrm — 否则 torch/lib 的旧 libdrm 破坏 pyrender 的 GLX；
+      2. 仅当显式设置 ``GAZE_ROCM_GFX_OVERRIDE``（如 ``10.3.0``）时，才设置
+         ``HSA_OVERRIDE_GFX_VERSION`` 并把 MIOpen 卷积切到通用 HIP kernel。
+         当前项目环境是 TheRock 原生 gfx1035（rocBLAS/MIOpen 自带 gfx1035），
+         不需要也不应该 ISA 伪装；旧式官方 ROCm 可设
+         ``GAZE_ROCM_GFX_OVERRIDE=10.3.0`` 复现旧的兼容模式。
 
-    纯 CPU / NVIDIA-CUDA build 下两个动作都无副作用，可以无条件调用。
+    纯 CPU / NVIDIA-CUDA build 下无副作用，可以无条件调用。
     """
-    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", GFX_OVERRIDE_DEFAULT)
+    override = os.environ.get(GFX_OVERRIDE_ENV, "").strip()
+    if override:
+        os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", override)
+        if os.environ.get("GAZE_ROCM_SAFE_KERNELS", "1") != "0":
+            os.environ.setdefault("MIOPEN_DEBUG_GCN_ASM_KERNELS", "0")
     preload_system_libdrm()
-    if os.environ.get("GAZE_ROCM_SAFE_KERNELS", "1") != "0":
-        os.environ.setdefault("MIOPEN_DEBUG_GCN_ASM_KERNELS", "0")
 
 
 def is_rocm_build() -> bool:
@@ -131,9 +138,10 @@ def is_rocm_igpu() -> bool:
 
 
 def setup_rocm_env() -> None:
-    """HIP build 下补上 HSA_OVERRIDE_GFX_VERSION（尊重用户已设置的值）。"""
-    if is_rocm_build():
-        os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", GFX_OVERRIDE_DEFAULT)
+    """仅当显式请求 ISA 伪装时，HIP build 下补上 HSA_OVERRIDE_GFX_VERSION。"""
+    override = os.environ.get(GFX_OVERRIDE_ENV, "").strip()
+    if override and is_rocm_build():
+        os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", override)
 
 
 def _probe_cuda() -> tuple[bool, str | None]:
@@ -186,6 +194,71 @@ def synchronize_device(device: str) -> None:
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def _is_cuda_device(device) -> bool:
+    """True for ``"cuda"``/``torch.device("cuda:0")`` but not other devices."""
+    return str(device).split(":", 1)[0].strip().lower() == "cuda"
+
+
+def fp16_autocast_enabled(device="cuda") -> bool:
+    """Whether GPU inference should run under fp16 autocast.
+
+    GazeTR's ResNet18 backbone is the entire cost and is well behaved in half
+    precision; on the Radeon 680M autocast is ~1.3x faster at batch=1 and
+    ~1.7x at batch>=16, while the gaze shift stays below 0.1 degree on the
+    ETH-XGaze sample (the transformer tail stays numerically trivial).  This
+    is an inference-only speed/heat win, so it is enabled by default on ROCm
+    builds; ``GAZE_ROCM_FP16=0`` restores strict fp32.  CPU/NVIDIA-CUDA are
+    left untouched (return False), so the flag has no effect elsewhere.
+
+    Half precision also shrinks the GPU busy window per forward, which keeps
+    the shared-memory iGPU further away from the sustained-load hang
+    documented in AGENTS.md.
+    """
+    if not _is_cuda_device(device):
+        return False
+    if os.environ.get("GAZE_ROCM_FP16", "1") == "0":
+        return False
+    try:
+        return is_rocm_build()
+    except Exception:  # noqa: BLE001 - torch probing must never break startup
+        return False
+
+
+@contextmanager
+def autocast_gpu(device="cuda"):
+    """Run the wrapped block under fp16 autocast when enabled (else no-op).
+
+    ``torch.autocast(device_type="cuda")`` is also the ROCm path (HIP reuses
+    the CUDA API names).  Ops without a half kernel transparently fall back
+    to fp32, so this is safe even if only part of a graph benefits.
+    """
+    if fp16_autocast_enabled(device):
+        import torch
+
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            yield
+    else:
+        yield
+
+
+def is_gpu_runtime_error(exc: BaseException) -> bool:
+    """Heuristic: did ``exc`` come from the HIP/CUDA runtime (vs. bad input)?
+
+    Used by the long-running webcam loop to tell a dead/erroring GPU context
+    apart from a one-off bad frame, so it can fall back to CPU instead of
+    spinning on a broken device.  A real fault usually names ``hip``/``cuda``
+    or a memory error; decoder/alignment errors do not.
+    """
+    text = str(exc).lower()
+    return (
+        "hip error" in text
+        or "cuda error" in text
+        or "out of memory" in text
+        or "memory access fault" in text
+        or "invalid device function" in text
+    )
 
 
 def prepare_rocm_display_env(device: str, headless: bool,

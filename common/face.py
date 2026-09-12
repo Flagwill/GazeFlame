@@ -67,6 +67,21 @@ DEFAULT_FOV_DEG = 40.0
 DETECT_MAX_DIM = 384
 
 
+def is_gazetr_crop(image_bgr: np.ndarray) -> bool:
+    """Return whether an image already has GazeTR's canonical input size.
+
+    The checkpoint is trained on 224x224 face crops.  Re-running face
+    detection and a perspective warp on one of those crops changes the image
+    distribution and can move the predicted gaze.
+    """
+    return (
+        isinstance(image_bgr, np.ndarray)
+        and image_bgr.ndim >= 2
+        and image_bgr.shape[0] == ROI_SIZE
+        and image_bgr.shape[1] == ROI_SIZE
+    )
+
+
 class NoFaceFoundError(RuntimeError):
     """Raised when dlib cannot find any face in the input image."""
 
@@ -87,7 +102,7 @@ def _ensure_dlib_ready() -> tuple:
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise ImportError(
                 "dlib is required for face alignment. Install it with:\n"
-                "  conda install -n gaze_flame -c conda-forge dlib --override-channels"
+                "  conda install -n gaze_flame_rocm -c conda-forge dlib --override-channels"
             ) from exc
 
         if not PREDICTOR_PATH.exists():
@@ -280,6 +295,23 @@ class FaceTracker:
 def landmarks_to_array(shape) -> np.ndarray:
     """Convert a dlib full_object_detection into an (68, 2) numpy array."""
     return np.array([[p.x, p.y] for p in shape.parts()], dtype=np.float64)
+
+
+def mirrored_face_info(info: dict | None, image_width: int) -> dict | None:
+    """Mirror pixel-space overlay data without changing pose metadata."""
+    if info is None:
+        return None
+    result = dict(info)
+    width = int(image_width)
+    if "rect" in result:
+        left, top, right, bottom = result["rect"]
+        result["rect"] = [width - 1 - right, top, width - 1 - left, bottom]
+    for key in ("landmarks68", "landmarks6"):
+        if result.get(key) is not None:
+            points = np.asarray(result[key], dtype=np.float64).copy()
+            points[:, 0] = width - 1 - points[:, 0]
+            result[key] = points
+    return result
 
 
 # ---------------------------------------------------------------------------

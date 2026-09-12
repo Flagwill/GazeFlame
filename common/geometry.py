@@ -34,6 +34,20 @@ def pitch_yaw_to_gaze(pitch: float, yaw: float) -> np.ndarray:
     return np.array([x, y, z], dtype=np.float64)
 
 
+def gazetr_to_flame(gaze: np.ndarray) -> np.ndarray:
+    """Convert a GazeTR vector into FLAME's right/up/forward frame.
+
+    GazeTR stores pitch on its first axis, yaw on its second axis, and uses
+    ``-Z`` for the viewing direction.  FLAME uses the usual model frame:
+    ``+X`` right, ``+Y`` up, ``+Z`` toward the camera.  The conversion is
+    therefore ``[x, y, z] -> [y, -x, -z]``.
+    """
+    value = np.asarray(gaze, dtype=np.float64).reshape(-1)
+    if value.size != 3 or not np.all(np.isfinite(value)):
+        raise ValueError("GazeTR vector must contain three finite values.")
+    return np.array([value[1], -value[0], -value[2]], dtype=np.float64)
+
+
 def gaze_to_dict(gaze: np.ndarray) -> dict[str, float]:
     """Return the gaze vector as ``{"x": ..., "y": ..., "z": ...}`` floats."""
     return {"x": float(gaze[0]), "y": float(gaze[1]), "z": float(gaze[2])}
