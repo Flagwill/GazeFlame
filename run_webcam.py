@@ -1,16 +1,17 @@
 """Real-time gaze tracking from a webcam or video file, optionally driving FLAME.
 
 Interactive mode opens a single window showing the live camera feed with face
-box / landmarks / gaze arrow, and (with ``--flame``) a side-by-side FLAME head
-whose eyeballs follow the gaze in real time.  The FLAME panel is rendered
-offscreen, so it also works without a GLFW-capable viewer.
+box / landmarks / gaze arrow, an optional side-by-side FLAME head, and an
+optional software-only assistive-control concept panel.  The FLAME panel is
+rendered offscreen, so it also works without a GLFW-capable viewer.
 
 Controls: ``q`` / ``ESC`` quit, ``s`` save a snapshot of the camera feed.
 
 Examples:
     python run_webcam.py --camera 0
-    python run_webcam.py --camera 0 --flame
+    python run_webcam.py --camera 0 --flame --assistive
     python run_webcam.py --video clip.mp4 --flame --no-align
+    python run_webcam.py --video clip.mp4 --flame --assistive --save-frames out/
     python run_webcam.py --camera 0 --headless --save-frames out/  # automation
     python run_webcam.py --camera 0 --calibrate profiles/me.json
     python run_webcam.py --camera 0 --calibration-file profiles/me.json \
@@ -66,6 +67,11 @@ import model  # noqa: E402
 from inference import predict_gaze  # noqa: E402
 
 from common.flame_mirror import FlameMirror, compose_with_head  # noqa: E402
+from common.assistive import (  # noqa: E402
+    AssistiveIntentState,
+    compose_with_assistive,
+    draw_assistive_panel,
+)
 from common.calibration import (  # noqa: E402
     CalibrationProfile,
     CalibrationSession,
@@ -166,6 +172,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, default=480, help="capture height")
     parser.add_argument("--flame", action="store_true",
                         help="show a FLAME head panel in the window tracking the gaze")
+    parser.add_argument("--assistive", action="store_true",
+                        help="show a software-only assistive-control concept panel; "
+                             "combine with --flame for the full three-panel view")
     parser.add_argument("--hide-gaze-arrows", action="store_true",
                         help="hide debug arrows in the FLAME eye panel")
     parser.add_argument("--head-size", type=int, default=480,
@@ -318,6 +327,7 @@ def main() -> int:
     head_img: np.ndarray | None = None
     read_failures = 0
     temporal = GazeTemporalState()
+    assistive_state = AssistiveIntentState() if args.assistive else None
     detected_events: list[dict] = []
     last_raw_pitch, last_raw_yaw = 0.0, 0.0
     inference_errors = 0
@@ -468,6 +478,29 @@ def main() -> int:
                     screen_pitch, screen_yaw, mirror=args.mirror
                 )
             estimate.screen_point = screen_point
+            assistive_estimate = None
+            if assistive_state is not None:
+                assistive_estimate = assistive_state.update(
+                    screen_point,
+                    valid=estimate.valid,
+                    confidence=estimate.confidence,
+                    fixation_duration=estimate.fixation_duration,
+                    velocity_deg_s=estimate.velocity_deg_s,
+                    blinking=estimate.blinking,
+                    timestamp=now,
+                )
+                if assistive_estimate.event:
+                    event = {
+                        "type": f"assistive_{assistive_estimate.event}",
+                        "frame": frame_idx,
+                        "target": (
+                            assistive_estimate.target.key
+                            if assistive_estimate.target is not None else None
+                        ),
+                        "status": assistive_estimate.status,
+                    }
+                    detected_events.append(event)
+                    print(f"event: {event['type']}")
             if estimate.events:
                 for event in estimate.events:
                     event["frame"] = frame_idx
@@ -522,13 +555,37 @@ def main() -> int:
                             traceback.print_exc()
                             last_render_error_time = now
 
+            composed = None
+            if args.assistive:
+                assistive_panel = draw_assistive_panel(
+                    annotated.shape[0], assistive_estimate
+                )
+                annotated = draw_screen_point(
+                    annotated,
+                    estimate.screen_point if estimate.valid else None,
+                )
+                composed = compose_with_assistive(
+                    annotated, head_img, assistive_panel
+                )
+
             if args.save_frames:
                 out_dir = Path(args.save_frames)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(out_dir / f"frame_{frame_idx:05d}.png"), annotated)
+                if composed is not None:
+                    assistive_dir = out_dir / "assistive"
+                    assistive_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(
+                        str(assistive_dir / f"frame_{frame_idx:05d}.png"), composed
+                    )
 
             if not args.headless:
-                composed = compose_with_head(annotated, head_img)
+                if composed is None:
+                    composed = compose_with_head(annotated, head_img)
+                if not args.assistive:
+                    composed = draw_screen_point(
+                        composed, estimate.screen_point if estimate.valid else None
+                    )
                 if calibration is not None and not calibration.finished:
                     composed = draw_calibration_target(
                         composed,
@@ -536,9 +593,6 @@ def main() -> int:
                         calibration.progress,
                         label=f"CALIBRATION {calibration.index + 1}/{len(calibration.points)}",
                     )
-                composed = draw_screen_point(
-                    composed, estimate.screen_point if estimate.valid else None
-                )
                 cv2.imshow(WINDOW_TITLE, fit_to_display(composed, display_size))
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):

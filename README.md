@@ -1,7 +1,8 @@
 # GazeFlame — GazeTR × FLAME_PyTorch 合并仓库
 
 把 **GazeTR**（Transformer 视线估计）与 **FLAME_PyTorch**（3D 头部参数模型）合并到一个仓库，
-形成 **视线估计 → 头部渲染** 的完整流水线：
+形成 **视线估计 → 头部渲染** 的完整流水线，并提供面向飞行模拟器的
+**驾驶员状态感知与辅助控制概念验证层**：
 
 ```
 任意人脸图片
@@ -17,6 +18,8 @@ Pitch / Yaw (弧度)
     │  common/flame_mirror.py + pyrender     FLAME 头部眼球驱动（离屏渲染）
     ▼
 带视线箭头的 3D 头部 + 标注输入图（合成到同一个窗口）
+
+可选概念层：视线落点 → 驾驶舱关注区域 → 操作意图 → 辅助状态
 ```
 
 
@@ -29,6 +32,7 @@ GazeFlame/
 │   ├── face.py              人脸检测 + ETH-XGaze 归一化对齐 (dlib)
 │   ├── flame_mirror.py      FLAME 离屏渲染 + 单窗口合成 (compose_with_head)
 │   ├── viz.py               2D 视线标注 (draw_overlay, 摄像头/图片共用)
+│   ├── assistive.py         视线目标/意图/辅助状态概念层与状态面板
 │   ├── download_dlib_model.py 下载 dlib 68点模型 (需联网, 一次性)
 │   └── models/              dlib shape_predictor 模型 (gitignore)
 ├── environment.yml          conda 环境定义 (name: gaze_flame_rocm)
@@ -75,6 +79,7 @@ nightly，torch 版本会滚动。
 DEVICE=cuda ./run.sh                      # 有 GPU 时走 cuda
 ./run.sh --skip-viewer                    # 只算角度, 不显示窗口
 ./run.sh --headless --save-image out.png  # 无窗口, 把合成图存到 PNG (适合自动化)
+./run.sh --assistive --headless --save-image assistive.png  # 增加辅助概念面板
 ./run.sh --no-align                       # 关闭人脸检测/对齐 (输入已是裁剪图时)
 ```
 
@@ -116,6 +121,8 @@ python gaze_viewer.py --gaze-x 0 --gaze-y 0.2 --gaze-z 1
 ```bash
 ./run_webcam.sh                         # 打开摄像头 0, 实时显示视线箭头
 ./run_webcam.sh --flame                 # 同一窗口右侧并排 FLAME 头部, 眼球跟随视线
+./run_webcam.sh --assistive             # 增加软件-only 辅助控制概念面板
+./run_webcam.sh --video clip.mp4 --flame --assistive --save-frames out/
 ./run_webcam.sh --video clip.mp4        # 也可以处理视频文件
 ./run_webcam.sh --camera 1 --no-mirror  # 指定摄像头 / 关闭自拍镜像
 DEVICE=cuda ./run_webcam.sh             # 有 GPU 时用 cuda
@@ -174,6 +181,14 @@ MODE2 reset`，与 kernel 集/精度无关，仅成倍延缓）——即这是 R
 ETH-XGaze 对齐 → GazeTR 推理（CPU 下本机实测约 **10fps**，受摄像头帧率上限约束）；
 加 `--flame` 后 FLAME 头部离屏渲染并按 `--head-fps`（默认 8）节流刷新，
 与标注后的画面合成到**同一个** `GazeFlame` 窗口，不拖慢主画面。
+
+加上 `--assistive` 后会增加 `ASSISTIVE CONTROL CONCEPT` 面板：它把归一化视点映射到
+抽象驾驶舱区域（SYSTEM STATUS、ATTITUDE、NAVIGATION、CONTROL AREA），结合注视时长
+和跟踪置信度显示 `MONITORING`、`INTENT DETECTED` 或 `ASSIST READY`。该层只表达
+“驾驶员状态感知 → 意图识别 → 辅助介入准备”的软件闭环，不模拟真实机械臂、飞行控制器
+或物理执行器；因此适合作为“机械臂辅助控制飞行模拟器”课题的概念验证界面。使用
+`--flame --assistive` 可同时看到输入图、FLAME 头部和辅助状态三类证据；使用视频文件
+作为输入时不需要连接摄像头。
 
 视点十字准星会先把 ETH-XGaze 标准化人脸坐标还原到原始相机坐标，再估算屏幕位置；加载
 `--calibration-file profiles/me.json` 后会使用九点个人校准得到的坐标，标记精度更高。

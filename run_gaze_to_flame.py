@@ -11,6 +11,9 @@ Orchestrates the two stages of the GazeFlame pipeline:
    (``common.geometry``).
 3. Render the FLAME head toward that vector (``common.flame_mirror``) and show
    it side-by-side with the annotated input image in ONE cv2 window.
+4. Optionally add a software-only assistive-control concept panel that maps
+   the gaze point to abstract cockpit regions.  It stops at intent display;
+   no robot or flight controller is simulated.
 
 By default the unified window is shown interactively (needs an X11 display).
 With ``--headless --save-image out.png`` the same composed image is written to
@@ -158,6 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="FLAME panel render edge length (default: 512)")
     parser.add_argument("--hide-gaze-arrows", action="store_true",
                         help="hide debug arrows in the FLAME eye panel")
+    parser.add_argument("--assistive", action="store_true",
+                        help="add the software-only assistive-control concept panel")
     parser.add_argument("--display-width", type=int, default=1280,
                         help="Max width of the composed window/panel scaling")
     parser.add_argument("--save-image", default=None,
@@ -178,14 +183,20 @@ def show_or_save(
     window_title: str = "GazeFlame",
     fullscreen: bool = True,
     screen_point: "np.ndarray | tuple[float, float] | None" = None,
+    assistive_panel: "np.ndarray | None" = None,
 ) -> None:
-    """Compose the two panels and either save them or show a single window."""
+    """Compose the visualization panels and either save or show one window."""
     from common.flame_mirror import compose_with_head
+    from common.assistive import compose_with_assistive
 
     from common.viz import draw_screen_point, fit_to_display
 
-    composed = compose_with_head(annotated, head_img)
-    composed = draw_screen_point(composed, screen_point)
+    if assistive_panel is not None:
+        annotated = draw_screen_point(annotated, screen_point)
+        composed = compose_with_assistive(annotated, head_img, assistive_panel)
+    else:
+        composed = compose_with_head(annotated, head_img)
+        composed = draw_screen_point(composed, screen_point)
     if save_image:
         cv2.imwrite(str(save_image), composed)
         print(f"已保存合成图: {save_image}")
@@ -311,6 +322,7 @@ def main() -> None:
         # 统一窗口：左侧标注输入图 + 右侧 FLAME 头部，二者合成到同一画面。
         t_flame = time.perf_counter()
         from common.flame_mirror import FlameMirror
+        from common.assistive import AssistiveIntentState, draw_assistive_panel
         from common.viz import draw_overlay
 
         screen_pitch, screen_yaw = camera_gaze_to_pitch_yaw(camera_gaze)
@@ -327,6 +339,25 @@ def main() -> None:
             screen_point=screen_point,
             camera_gaze=camera_gaze,
         )
+
+        assistive_panel = None
+        if args.assistive:
+            # A still image proves the perception/visualization path, but it
+            # cannot prove a temporal fixation.  Keep the state honest and
+            # label it as current attention rather than inferred intent.
+            reprojection_error = float(face_info.get("reprojection_error", 0.0)) if face_info else 0.0
+            confidence = float(np.exp(-max(reprojection_error, 0.0) / 8.0)) if face_info else 0.0
+            assistive_estimate = AssistiveIntentState().update(
+                screen_point,
+                valid=face_info is not None,
+                confidence=confidence,
+                fixation_duration=0.0,
+                velocity_deg_s=0.0,
+                blinking=False,
+            )
+            assistive_panel = draw_assistive_panel(
+                annotated.shape[0], assistive_estimate
+            )
 
         mirror = FlameMirror(
             flame_render_device(device), args.head_size, args.head_size,
@@ -348,6 +379,7 @@ def main() -> None:
                 args.headless,
                 fullscreen=not args.windowed,
                 screen_point=screen_point,
+                assistive_panel=assistive_panel,
             )
         finally:
             mirror.close()
