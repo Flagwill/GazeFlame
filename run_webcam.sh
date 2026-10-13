@@ -17,30 +17,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CONDA_BIN="$(command -v conda || true)"
-if [[ -z "${CONDA_BIN}" && -x /opt/anaconda/bin/conda ]]; then
-  CONDA_BIN=/opt/anaconda/bin/conda
-fi
-if [[ -z "${CONDA_BIN}" ]]; then
-  echo "错误: 找不到 conda, 请先安装或将其加入 PATH" >&2
-  exit 1
-fi
-
-ENV_NAME="gaze_flame_rocm"
-ENV_PATH="$(awk -v n="${ENV_NAME}" '
-  $1 == n {print $2; exit}
-  $1 == "*" && $2 == n {print $3; exit}' <<< "$("${CONDA_BIN}" env list)")"
-if [[ -z "${ENV_PATH}" ]]; then
-  echo "错误: conda 环境 ${ENV_NAME} 不存在, 请先运行:" >&2
-  echo "  conda env create -f ${REPO_ROOT}/environment.yml" >&2
-  exit 1
-fi
-
-PY="${ENV_PATH%/}/bin/python"
-if [[ ! -x "${PY}" ]]; then
-  echo "错误: 找不到环境 python (env path: ${ENV_PATH})" >&2
-  exit 1
-fi
+source "${REPO_ROOT}/common/conda_env.sh"
+PY="$(gazeflame_find_python)"
 
 # GPU 探测与 AMD ROCm 环境变量由 Python 端 common/gpu.py 负责
 # (shell 里 torch.cuda.is_available() 对 ROCm 不支持的芯片会误报 True)。

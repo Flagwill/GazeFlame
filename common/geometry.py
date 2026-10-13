@@ -102,6 +102,11 @@ def camera_gaze_to_pitch_yaw(gaze: np.ndarray) -> tuple[float, float]:
     return float(pitch), float(yaw)
 
 
+def camera_pitch_yaw_to_gaze(pitch: float, yaw: float) -> np.ndarray:
+    """Inverse of camera_gaze_to_pitch_yaw (pitch-up, yaw-right)."""
+    return gazetr_angles_to_gaze(-float(yaw), float(pitch))
+
+
 def gaze_to_dict(gaze: np.ndarray) -> dict[str, float]:
     """Return the gaze vector as ``{"x": ..., "y": ..., "z": ...}`` floats."""
     return {"x": float(gaze[0]), "y": float(gaze[1]), "z": float(gaze[2])}

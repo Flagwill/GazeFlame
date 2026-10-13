@@ -79,6 +79,10 @@ class AssistiveIntentState:
         self.min_confidence = float(min_confidence)
         self._last_target_key: str | None = None
         self._last_status: str | None = None
+        self._dwell_started: float | None = None
+        self._fixation_origin: float | None = None
+        self._last_fixation_duration = 0.0
+        self._last_timestamp: float | None = None
 
     @staticmethod
     def _find_target(point: np.ndarray | None) -> AssistiveTarget | None:
@@ -105,17 +109,49 @@ class AssistiveIntentState:
         timestamp: float | None = None,
     ) -> AssistiveEstimate:
         """Update the conceptual assistance state for one frame."""
-        del timestamp  # Reserved for future event logging; state is frame-based.
         value = (
             None
             if point is None
             else np.asarray(point, dtype=np.float64).reshape(-1)[:2]
         )
-        confidence = float(np.clip(confidence, 0.0, 1.0))
-        valid = bool(valid and value is not None and confidence >= self.min_confidence)
+        finite = np.all(np.isfinite([confidence, fixation_duration, velocity_deg_s]))
+        confidence = float(np.clip(confidence, 0.0, 1.0)) if finite else 0.0
+        point_valid = (value is not None and value.size == 2
+                       and np.all(np.isfinite(value))
+                       and np.all((value >= 0.0) & (value <= 1.0)))
+        now = float(timestamp) if timestamp is not None else None
+        clock_valid = now is None or (np.isfinite(now) and (
+            self._last_timestamp is None or now >= self._last_timestamp))
+        valid = bool(valid and point_valid and finite and clock_valid
+                     and confidence >= self.min_confidence)
         target = self._find_target(value) if valid else None
-        fixation_duration = max(0.0, float(fixation_duration))
-        velocity_deg_s = max(0.0, float(velocity_deg_s))
+        supplied_fixation = max(0.0, float(fixation_duration)) if finite else 0.0
+        velocity_deg_s = max(0.0, float(velocity_deg_s)) if finite else 0.0
+        target_key = target.key if target else None
+        previous_target_key = self._last_target_key
+        eligible = valid and target is not None and not blinking and velocity_deg_s < 100.0
+        reset = (not eligible or target_key != previous_target_key
+                 or supplied_fixation < self._last_fixation_duration)
+        if reset:
+            self._dwell_started = None
+            self._fixation_origin = None
+        fixation_duration = 0.0
+        if eligible:
+            if now is not None:
+                if self._dwell_started is None:
+                    self._dwell_started = now
+                # Temporal fixation can span several cockpit regions.  Both
+                # local dwell and temporal evidence must satisfy the threshold.
+                fixation_duration = min(supplied_fixation, now - self._dwell_started)
+            else:
+                # Legacy callers supply only durations: subtract the evidence
+                # already present when this target was first observed.
+                if self._fixation_origin is None:
+                    self._fixation_origin = supplied_fixation
+                fixation_duration = max(0.0, supplied_fixation - self._fixation_origin)
+        self._last_fixation_duration = supplied_fixation
+        if now is not None and clock_valid:
+            self._last_timestamp = now
 
         if not valid:
             status = "NO_TRACKING"
@@ -142,15 +178,6 @@ class AssistiveIntentState:
             status_label = "ASSIST READY"
             intent_label = f"ASSIST {target.label}"
 
-        target_key = target.key if target else None
-        previous_target_key = self._last_target_key
-        if target_key != previous_target_key and target is not None:
-            # A new cockpit region must earn its own dwell time.  This keeps
-            # the concept layer from carrying fixation evidence across a
-            # saccade or a target boundary.
-            status = "MONITORING"
-            status_label = "MONITORING"
-            intent_label = f"OBSERVING {target.label}"
         event = None
         if target_key != previous_target_key and target_key is not None:
             event = "target_changed"
@@ -164,7 +191,7 @@ class AssistiveIntentState:
             status=status,
             status_label=status_label,
             intent_label=intent_label,
-            point=None if value is None else value.copy(),
+            point=value.copy() if point_valid else None,
             confidence=confidence,
             fixation_duration=fixation_duration,
             valid=valid,
@@ -220,7 +247,7 @@ def draw_assistive_panel(
         text(target.label, (box[0] + 7, box[1] + 22), 0.43,
              color if active else (145, 150, 155), 1)
 
-    if estimate is not None and estimate.point is not None:
+    if estimate is not None and estimate.valid and estimate.point is not None:
         point = np.asarray(estimate.point, dtype=np.float64)
         marker = (
             cockpit_left + int(np.clip(point[0], 0.0, 1.0) * (cockpit_right - cockpit_left)),

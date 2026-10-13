@@ -8,9 +8,15 @@ dist/
 # 输出产物（运行时生成的，不入库）
 flame/outputs/
 vis_results/
+demo_outputs/
+/events.json
+/gaze_snapshot_*.png
 *.log
 
-# dlib 68点模型 (约 157MB, 用 python -m common.download_dlib_model 下载)
+# 个人校准与摄像头/坐姿相关，不作为通用示例提交
+/profiles/*.json
+
+# dlib 68点模型 (约 96MB, 用 python -m common.download_dlib_model 下载)
 common/models/*.dat
 common/models/*.bz2
 

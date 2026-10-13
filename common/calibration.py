@@ -14,6 +14,7 @@ DEFAULT_CALIBRATION_POINTS = tuple(
     (x, y) for y in (0.15, 0.5, 0.85) for x in (0.15, 0.5, 0.85)
 )
 MAX_USABLE_RMSE = 0.15
+MAX_USABLE_GAIN = 8.0  # normalized screen units / radian
 
 
 def angles_to_screen_point(
@@ -66,14 +67,22 @@ class CalibrationProfile:
     max_yaw_deg: float = 40.0
     rmse: float = 0.0
     feature_frame: str = "camera_angles"
+    validation_rmse: float | None = None
+    sample_counts: tuple[int, ...] = ()
+    point_spread_deg: tuple[float, ...] = ()
 
     def is_usable(self, max_rmse: float = MAX_USABLE_RMSE) -> bool:
         """Return whether this profile is finite and fit well enough to use."""
         return bool(
-            np.all(np.isfinite(self.matrix))
+            np.shape(self.matrix) == (2, 3)
+            and np.all(np.isfinite(self.matrix))
             and np.isfinite(self.rmse)
             and 0.0 <= self.rmse <= float(max_rmse)
             and self.feature_frame == "camera_angles"
+            and np.linalg.norm(np.asarray(self.matrix)[:, :2], ord=2) <= MAX_USABLE_GAIN
+            and (self.validation_rmse is None or (
+                np.isfinite(self.validation_rmse) and 0 <= self.validation_rmse <= max_rmse
+            ))
         )
 
     def screen_point(self, pitch: float, yaw: float) -> np.ndarray:
@@ -91,12 +100,15 @@ class CalibrationProfile:
 
     def to_dict(self) -> dict:
         return {
-            "version": 2,
+            "version": 3,
             "matrix": np.asarray(self.matrix, dtype=np.float64).tolist(),
             "max_pitch_deg": self.max_pitch_deg,
             "max_yaw_deg": self.max_yaw_deg,
             "rmse": self.rmse,
             "feature_frame": self.feature_frame,
+            "validation_rmse": self.validation_rmse,
+            "sample_counts": list(self.sample_counts),
+            "point_spread_deg": list(self.point_spread_deg),
         }
 
     def save(self, path: str | Path) -> None:
@@ -122,6 +134,10 @@ class CalibrationProfile:
                 "feature_frame",
                 "model_angles" if int(data.get("version", 1)) < 2 else "camera_angles",
             ),
+            validation_rmse=(None if data.get("validation_rmse") is None
+                             else float(data["validation_rmse"])),
+            sample_counts=tuple(data.get("sample_counts", ())),
+            point_spread_deg=tuple(data.get("point_spread_deg", ())),
         )
 
 
@@ -131,9 +147,9 @@ class CalibrationSession:
     def __init__(
         self,
         points=DEFAULT_CALIBRATION_POINTS,
-        settle_seconds: float = 0.45,
-        hold_seconds: float = 0.9,
-        min_samples: int = 8,
+        settle_seconds: float = 0.7,
+        hold_seconds: float = 1.5,
+        min_samples: int = 10,
     ):
         self.points = tuple((float(x), float(y)) for x, y in points)
         self.settle_seconds = float(settle_seconds)
@@ -146,6 +162,11 @@ class CalibrationSession:
         self._point_features: list[np.ndarray] = []
         self.finished = False
         self.profile: CalibrationProfile | None = None
+        self._sample_started: float | None = None
+        self._last_update: float | None = None
+        self.sample_counts: list[int] = []
+        self.point_spread_deg: list[float] = []
+        self.status = "LOOK AT TARGET"
 
     @property
     def target(self) -> tuple[float, float] | None:
@@ -165,41 +186,106 @@ class CalibrationSession:
         yaw: float,
         valid: bool,
         timestamp: float | None = None,
+        confidence: float = 1.0,
+        blinking: bool = False,
+        velocity_deg_s: float = 0.0,
     ) -> CalibrationProfile | None:
         if self.finished:
             return self.profile
         now = time.perf_counter() if timestamp is None else float(timestamp)
+        if self._last_update is not None:
+            if now <= self._last_update:
+                return None
+            if now - self._last_update > 0.35:
+                self._point_features.clear()
+                self._point_samples = 0
+                self._sample_started = None
+        self._last_update = now
         if self.started_at is None:
             self.started_at = now
         elapsed = now - self.started_at
-        if valid and elapsed >= self.settle_seconds:
+        usable = (
+            valid and not blinking
+            and np.all(np.isfinite([pitch, yaw, confidence, velocity_deg_s]))
+            and confidence >= 0.5 and velocity_deg_s <= 35.0
+        )
+        if not usable:
+            # Require a fresh steady hold after loss, blink or saccade; stale
+            # samples from a previous pose must not complete the target.
+            self._point_features.clear()
+            self._point_samples = 0
+            self._sample_started = None
+            self.status = "WAIT FOR OPEN EYES / STEADY TRACKING"
+            return None
+        self.status = "LOOK AT TARGET" if elapsed < self.settle_seconds else "HOLD STEADY"
+        if elapsed >= self.settle_seconds:
+            if self._sample_started is None:
+                self._sample_started = now
             self._point_features.append(
                 np.array([pitch, yaw, 1.0], dtype=np.float64)
             )
             self._point_samples += 1
-        if elapsed < self.settle_seconds + self.hold_seconds:
+        if self._sample_started is None or now - self._sample_started < self.hold_seconds:
             return None
         if self._point_samples < self.min_samples:
             # Keep the same target on screen until a face is available for a
             # sufficient number of frames; a temporary tracking loss should
             # never produce a misleading profile or crash the live loop.
             return None
-        # A short median per target suppresses blink/tracker/model outliers;
-        # fitting every correlated frame made one noisy hold dominate a whole
-        # calibration profile.
-        feature = np.median(np.vstack(self._point_features), axis=0)
+        features = np.vstack(self._point_features)
+        center = np.median(features, axis=0)
+        deviation = np.abs(features[:, :2] - center[:2])
+        sigma = 1.4826 * np.median(deviation, axis=0)
+        inliers = np.all(deviation <= np.maximum(3.0 * sigma, np.radians(0.75)), axis=1)
+        kept = features[inliers]
+        spread = (float(np.degrees(np.percentile(np.linalg.norm(kept[:, :2] - center[:2], axis=1), 90)))
+                  if len(kept) else float("inf"))
+        if len(kept) < self.min_samples or spread > 3.0:
+            self.status = "POINT TOO NOISY / KEEP LOOKING"
+            self._point_features.clear()
+            self._point_samples = 0
+            self._sample_started = None
+            return None
+        feature = np.median(kept, axis=0)
         self.samples.append((feature, np.array(self.target, dtype=np.float64)))
+        self.sample_counts.append(len(kept))
+        self.point_spread_deg.append(spread)
         self.index += 1
         self.started_at = now
         self._point_samples = 0
         self._point_features = []
+        self._sample_started = None
         if self.index < len(self.points):
             return None
         features = np.vstack([item[0] for item in self.samples])
         targets = np.vstack([item[1] for item in self.samples])
+        centered = features[:, :2] - features[:, :2].mean(axis=0)
+        singular = np.linalg.svd(centered, compute_uv=False)
+        # A narrow/collinear range can fit the nine medians but amplify tiny
+        # angle noise or extrapolate wildly on the next frame.
+        well_spread = (
+            len(singular) == 2 and singular[-1] > np.radians(1.0)
+            and singular[-1] / max(singular[0], 1e-8) >= 0.08
+            and np.linalg.matrix_rank(features) == 3
+        )
         matrix = np.linalg.lstsq(features, targets, rcond=None)[0].T
         prediction = features @ matrix.T
         rmse = float(np.sqrt(np.mean((prediction - targets) ** 2)))
-        self.profile = CalibrationProfile(matrix=matrix, rmse=rmse)
+        # Predict each target without using it for the fit. Training RMSE alone
+        # rewards over-sensitive maps and conceals a badly sampled corner.
+        held_out = []
+        for i in range(len(features)):
+            mask = np.arange(len(features)) != i
+            fit = np.linalg.lstsq(features[mask], targets[mask], rcond=None)[0]
+            held_out.append(features[i] @ fit - targets[i])
+        validation_rmse = float(np.sqrt(np.mean(np.asarray(held_out) ** 2)))
+        self.profile = CalibrationProfile(
+            matrix=matrix, rmse=rmse,
+            validation_rmse=validation_rmse if well_spread else float("inf"),
+            sample_counts=tuple(self.sample_counts),
+            point_spread_deg=tuple(self.point_spread_deg),
+        )
         self.finished = True
+        self.status = (f"CALIBRATION READY / RMSE {validation_rmse:.3f}" if self.profile.is_usable()
+                       else "CALIBRATION REJECTED / PRESS C TO RETRY")
         return self.profile

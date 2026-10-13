@@ -330,3 +330,50 @@ GazeTR / FLAME 视线与头姿感知
 - FLAME 组合图仍继承原有 pyrender/OpenGL 前置条件；没有可用 X11/GL 时，使用
   `--assistive` 且不加 `--flame` 的视频模式验证概念层，或只运行辅助面板单元测试，
   不要把 OpenGL 初始化失败误判为辅助状态机错误。
+
+## 结题报告演示 Demo
+
+- 新入口 `./run_demo.sh --camera 0` 默认 CPU + FLAME + 辅助状态，委托
+  `run_webcam.main(argv)` 的完整真实推理流水线；`--video` 同样逐帧真实推理。
+  原入口也可用 `./run_webcam.sh --demo --flame`。实时参数和个人校准可透传。
+- `common/demo.py:DemoDashboard` 为统一 1440×900 演示面板，展示标注输入、实际网络
+  对齐裁剪、FLAME、辅助状态、滤波曲线和事件；不加载模型、不创建 GL 场景。
+- 无输入源的 `./run_demo.sh` 为约 27s 的报告回放：前3s单图真实推理（不累积注视），
+  随后明确标注合成眼动输入。`ReportReplay` 仅验证公共时域/辅助规则，不代表模型精度。
+  SPACE 暂停回放时不能累计注视时间。摄像头和视频模式没有合成输入。
+- 视频事件/注视时间已改用源帧率的媒体时钟，避免快速离线处理或保存图片改变时间证据。
+- `AssistiveIntentState` 使用当前区域的本地停留时间与时域注视证据的较小值；区域切换、
+  眨眼、低置信度、丢脸、扫视均重新累计，不能只重置第一帧后继承旧区域的长注视。
+- 三个启动脚本共用 `common/conda_env.sh` 选择解释器：优先 `GAZE_PYTHON`，其次已激活
+  的 `CONDA_PREFIX`；回退解析 conda env list 时按绝对路径识别，不把名称后的 `*` / `+`
+  标记当作路径（支持路径含空格）。回归测试在 `tests/test_launchers.py`。
+- 使用说明在 `docs/DEMO.md`；默认输出 `demo_outputs/`（gitignore），回放保存阶段/状态
+  PNG、events.json、summary.json；`--save-video PATH` 保存 MP4。实时 headless 保存帧。
+  `--no-flame` 不需要 GL，`--skip-image --no-flame` 不需要 torch 权重或摄像头。
+- 演示仍不发送任何机械臂、飞控、执行器命令，仍须保留 ROCm/GL CPU 回退及 GPU 护栏。
+  相关测试在 `tests/test_demo.py` 和扩展的 `tests/test_assistive.py`。
+
+## 实时视点稳定性与校准（2026-10-13）
+
+- `GazeTemporalState` 内部先用当前 `normalization_rotation.T` 还原相机向量，再做
+  One Euro（默认 min_cutoff=0.5Hz、beta=1.2，角度单位弧度）；消费
+  `estimate.camera_gaze`，不要再乘一次当前 R.T，否则会重新引入头姿/对齐抖动。
+  `estimate.gaze` 和 pitch/yaw 保留当前归一化系的兼容输出。
+- 闭眼从首帧阻止测量入滤波；低几何/跟踪质量帧也不更新。12° 以上尖峰须后续相邻帧
+  确认，持续移动仍跟随；长于 max_missing_seconds 的无有效测量期重置滤波与注视证据。
+  `measurement_valid` 表示该帧是否真正进入滤波，不能仅用 face_count 采集校准样本。
+- demo/webcam 的 `c` 在当前布局启动九点校准；默认 settle=0.7s、hold=1.5s、至少10帧。
+  blink/低质量/扫视打断当前 hold；中位数去离群、留一目标验证、角度覆盖和增益检查通过
+  才保存/使用新 profile，失败保留旧文件。v3 增加验证误差和采样诊断，v2 相机系兼容。
+  校准目标相对当前窗口内容定义，需在实际 demo 布局和相同坐姿/窗口模式内校准。
+- `tests/test_tracking_accuracy.py` 是确定性信号与映射回归，不是被试精度基准；不能把
+  合成降噪结果表述为神经网络识别准确率提升。模型权重、训练归一化和 GPU 护栏未改变。
+  `tests/test_webcam_calibration.py` 在 mock 摄像头/GUI 的真实入口验证保存只执行一次、
+  `c` 复用已加载路径及拒绝结果不覆盖原文件。
+
+## 仓库产物约定
+
+- `profiles/*.json` 为本机/个人校准，`events.json`、`gaze_snapshot_*.png` 和
+  `demo_outputs/` 为运行产物，均 gitignore；不要把个人 profile 当作通用示例提交。
+  初次运行按 `profiles/README.md` 在实际 demo 中校准。
+- 必需的 `gazetr/model/*.pt`、`flame/model/*` 及已有示例素材继续保留，不按临时产物清理。

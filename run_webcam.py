@@ -5,7 +5,7 @@ box / landmarks / gaze arrow, an optional side-by-side FLAME head, and an
 optional software-only assistive-control concept panel.  The FLAME panel is
 rendered offscreen, so it also works without a GLFW-capable viewer.
 
-Controls: ``q`` / ``ESC`` quit, ``s`` save a snapshot of the camera feed.
+Controls: ``q`` / ``ESC`` quit, ``s`` save a snapshot, ``c`` calibrate live.
 
 Examples:
     python run_webcam.py --camera 0
@@ -85,6 +85,7 @@ from common.geometry import (  # noqa: E402
     gazetr_angles_to_gaze,
 )
 from common.temporal import GazeTemporalState  # noqa: E402
+from common.demo import DemoDashboard  # noqa: E402
 from common.viz import (  # noqa: E402
     WINDOW_TITLE,
     create_display_window,
@@ -175,6 +176,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--assistive", action="store_true",
                         help="show a software-only assistive-control concept panel; "
                              "combine with --flame for the full three-panel view")
+    parser.add_argument("--demo", action="store_true",
+                        help="report-demo dashboard with full-chain evidence and "
+                             "assistive states (implies --assistive)")
+    parser.add_argument("--save-video", type=str, default=None,
+                        help="export the demo dashboard to an MP4 (requires --demo)")
+    parser.add_argument("--output-fps", type=float, default=15.0,
+                        help="exported webcam video FPS (default: 15)")
     parser.add_argument("--hide-gaze-arrows", action="store_true",
                         help="hide debug arrows in the FLAME eye panel")
     parser.add_argument("--head-size", type=int, default=480,
@@ -194,10 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="load an affine personal gaze calibration JSON")
     parser.add_argument("--calibrate", type=str, default=None, metavar="PATH",
                         help="run timed 9-point calibration and save the profile")
-    parser.add_argument("--calibration-settle", type=float, default=0.45,
+    parser.add_argument("--calibration-settle", type=float, default=0.7,
                         help="seconds to wait before collecting each calibration point")
-    parser.add_argument("--calibration-hold", type=float, default=0.9,
+    parser.add_argument("--calibration-hold", type=float, default=1.5,
                         help="seconds to collect each calibration point")
+    parser.add_argument("--gaze-min-cutoff", type=float, default=0.5,
+                        help="stationary gaze smoothing cutoff in Hz (default: 0.5)")
+    parser.add_argument("--gaze-beta", type=float, default=1.2,
+                        help="adaptive response to gaze motion in radians (default: 1.2)")
+    parser.add_argument("--gaze-spike-deg", type=float, default=12.0,
+                        help="confirm larger one-frame gaze jumps (default: 12 degrees)")
     parser.add_argument("--events-out", type=str, default=None,
                         help="write detected gaze events as a JSON array")
     parser.add_argument("--max-frames", type=int, default=0,
@@ -205,8 +219,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.demo:
+        args.assistive = True
+    if args.save_video and not args.demo:
+        parser.error("--save-video requires --demo")
+    if not np.isfinite(args.output_fps) or args.output_fps <= 0:
+        parser.error("--output-fps must be positive and finite")
+    for option, value in (("--gaze-min-cutoff", args.gaze_min_cutoff),
+                          ("--gaze-spike-deg", args.gaze_spike_deg),
+                          ("--calibration-hold", args.calibration_hold)):
+        if not np.isfinite(value) or value <= 0:
+            parser.error(f"{option} must be positive and finite")
+    for option, value in (("--gaze-beta", args.gaze_beta),
+                          ("--calibration-settle", args.calibration_settle)):
+        if not np.isfinite(value) or value < 0:
+            parser.error(f"{option} must be nonnegative and finite")
 
     if args.calibrate and args.headless:
         raise SystemExit("--calibrate requires a visible window")
@@ -224,7 +254,7 @@ def main() -> int:
             )
         else:
             print(
-                f"警告: 校准文件误差过大 (RMSE={loaded_profile.rmse:.4f}), "
+                f"警告: 校准文件质量不合格 (RMSE={loaded_profile.rmse:.4f}), "
                 "忽略该文件；请重新运行 --calibrate。",
                 file=sys.stderr,
             )
@@ -297,17 +327,23 @@ def main() -> int:
         # 过期画面, 压到 1 以降低延迟 (不支持的驱动上是无害的空操作)。
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+    video_fps = float(cap.get(cv2.CAP_PROP_FPS)) if args.video else args.output_fps
+    if not np.isfinite(video_fps) or video_fps <= 0:
+        video_fps = 30.0
+    dashboard = DemoDashboard() if args.demo else None
+    video_writer = None
+
     mirror: FlameMirror | None = None
     if args.flame:
-        if args.headless and not args.save_frames:
-            print("提示: --headless 且未指定 --save-frames 时跳过 FLAME 渲染")
+        if args.headless and not args.save_frames and not args.save_video:
+            print("提示: --headless 且未指定保存路径时跳过 FLAME 渲染")
         else:
             mirror = FlameMirror(
                 flame_render_device(str(device)), args.head_size, args.head_size,
                 show_arrows=not args.hide_gaze_arrows,
             )
 
-    print(f"处理 {source_desc} (按 q/ESC 退出, s 保存快照)")
+    print(f"处理 {source_desc} (按 q/ESC 退出, s 保存快照, c 在当前窗口校准)")
     print("-" * 60)
 
     if not args.headless:
@@ -323,10 +359,12 @@ def main() -> int:
     last_fwd_end = time.perf_counter()
     last_gaze: np.ndarray | None = None
     last_head_pose: np.ndarray | None = None
-    last_normalization_rotation: np.ndarray | None = None
     head_img: np.ndarray | None = None
     read_failures = 0
-    temporal = GazeTemporalState()
+    temporal = GazeTemporalState(
+        min_cutoff=args.gaze_min_cutoff, beta=args.gaze_beta,
+        spike_threshold_deg=args.gaze_spike_deg,
+    )
     assistive_state = AssistiveIntentState() if args.assistive else None
     detected_events: list[dict] = []
     last_raw_pitch, last_raw_yaw = 0.0, 0.0
@@ -341,6 +379,8 @@ def main() -> int:
     if head_dir:
         head_dir.mkdir(parents=True, exist_ok=True)
 
+    playback_t0 = time.perf_counter()
+    fps_t0 = time.time()
     try:
         while True:
             ret, frame = cap.read()
@@ -423,36 +463,9 @@ def main() -> int:
                         degraded_probes = 0
             frame_idx += 1
 
-            now = time.perf_counter()
-            raw_model_gaze = gazetr_angles_to_gaze(raw_pitch, raw_yaw)
-            normalization_rotation = (
-                info.get("normalization_rotation") if info is not None else None
-            )
-            if normalization_rotation is not None:
-                last_normalization_rotation = normalization_rotation
-            elif last_normalization_rotation is not None:
-                normalization_rotation = last_normalization_rotation
-            raw_camera_gaze = gaze_to_camera(
-                raw_model_gaze, normalization_rotation
-            )
-            calibration_pitch, calibration_yaw = camera_gaze_to_pitch_yaw(
-                raw_camera_gaze
-            )
-            if calibration is not None:
-                new_profile = calibration.update(
-                    calibration_pitch,
-                    calibration_yaw,
-                    face_count > 0,
-                    timestamp=now,
-                )
-                if new_profile is not None:
-                    new_profile.save(args.calibrate)
-                    profile = new_profile
-                    print(
-                        f"Calibration saved: {args.calibrate} "
-                        f"(RMSE={new_profile.rmse:.4f})"
-                    )
-
+            # File playback uses the media clock, not CPU processing speed.
+            # Otherwise headless/fast decoding invents or loses dwell evidence.
+            now = ((frame_idx - 1) / video_fps if args.video else time.perf_counter())
             estimate = temporal.update(
                 raw_pitch,
                 raw_yaw,
@@ -460,12 +473,36 @@ def main() -> int:
                 info=info,
                 timestamp=now,
             )
-            # Filter first, then map the filtered, head-compensated direction
-            # to the display.  Mapping the raw angles made the crosshair jump
-            # even when the temporal gaze estimate was stable.
-            filtered_camera_gaze = gaze_to_camera(
-                estimate.gaze, normalization_rotation
-            )
+            if calibration is not None and not calibration.finished:
+                calibration_pitch, calibration_yaw = 0.0, 0.0
+                if estimate.valid and estimate.measurement_valid:
+                    raw_camera_gaze = gaze_to_camera(
+                        gazetr_angles_to_gaze(raw_pitch, raw_yaw),
+                        info.get("normalization_rotation"),
+                    )
+                    calibration_pitch, calibration_yaw = camera_gaze_to_pitch_yaw(raw_camera_gaze)
+                new_profile = calibration.update(
+                    calibration_pitch,
+                    calibration_yaw,
+                    estimate.valid and estimate.measurement_valid,
+                    timestamp=now,
+                    confidence=estimate.confidence,
+                    blinking=estimate.blinking,
+                    velocity_deg_s=estimate.velocity_deg_s,
+                )
+                if new_profile is not None:
+                    if new_profile.is_usable():
+                        new_profile.save(args.calibrate)
+                        profile = new_profile
+                        print(f"Calibration saved: {args.calibrate} "
+                              f"(RMSE={new_profile.rmse:.4f}, "
+                              f"held-out RMSE={new_profile.validation_rmse:.4f})")
+                    else:
+                        print("警告: 校准未通过质量检查，保留原校准文件；按 c 重试。", file=sys.stderr)
+
+            # Temporal state already restores and filters the complete camera
+            # direction. Applying a fresh R.T here would reintroduce pose jitter.
+            filtered_camera_gaze = estimate.camera_gaze
             screen_pitch, screen_yaw = camera_gaze_to_pitch_yaw(
                 filtered_camera_gaze
             )
@@ -493,6 +530,7 @@ def main() -> int:
                     event = {
                         "type": f"assistive_{assistive_estimate.event}",
                         "frame": frame_idx,
+                        "timestamp": estimate.timestamp,
                         "target": (
                             assistive_estimate.target.key
                             if assistive_estimate.target is not None else None
@@ -522,10 +560,7 @@ def main() -> int:
                 screen_point=screen_point,
                 camera_gaze=filtered_camera_gaze,
             )
-            if face_count > 0:
-                filtered_camera_gaze = gaze_to_camera(
-                    estimate.gaze, normalization_rotation
-                )
+            if estimate.valid:
                 last_gaze = camera_to_flame(filtered_camera_gaze)
                 # ``head_pose`` in ``info`` is the current solvePnP rotation.
                 # Do not average Rodrigues-vector components for the render:
@@ -556,7 +591,30 @@ def main() -> int:
                             last_render_error_time = now
 
             composed = None
-            if args.assistive:
+            if dashboard is not None:
+                measured_fps = frame_idx / max(time.perf_counter() - playback_t0, 1e-3)
+                composed = dashboard.render(
+                    annotated, head_img, estimate, assistive_estimate,
+                    filtered_camera_gaze,
+                    source="VIDEO / REAL GazeTR INFERENCE" if args.video else
+                           "WEBCAM / LIVE GazeTR INFERENCE",
+                    stage=(calibration.status if calibration is not None else
+                           "Driver perception -> cockpit attention -> intent -> assistance readiness"),
+                    device=str(device), crop_bgr=_prep if estimate.valid else None,
+                    fps=measured_fps, calibrated=profile is not None,
+                )
+                if args.save_video:
+                    if video_writer is None:
+                        video_path = Path(args.save_video)
+                        video_path.parent.mkdir(parents=True, exist_ok=True)
+                        video_writer = cv2.VideoWriter(
+                            str(video_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                            video_fps, (composed.shape[1], composed.shape[0]),
+                        )
+                        if not video_writer.isOpened():
+                            raise RuntimeError(f"无法创建演示视频: {video_path}")
+                    video_writer.write(composed)
+            elif args.assistive:
                 assistive_panel = draw_assistive_panel(
                     annotated.shape[0], assistive_estimate
                 )
@@ -592,15 +650,28 @@ def main() -> int:
                         calibration.target,
                         calibration.progress,
                         label=f"CALIBRATION {calibration.index + 1}/{len(calibration.points)}",
+                        status=calibration.status,
                     )
                 cv2.imshow(WINDOW_TITLE, fit_to_display(composed, display_size))
-                key = cv2.waitKey(1) & 0xFF
+                delay = 1
+                if args.demo and args.video:
+                    deadline = playback_t0 + frame_idx / video_fps
+                    delay = max(1, round((deadline - time.perf_counter()) * 1000))
+                key = cv2.waitKey(delay) & 0xFF
                 if key in (27, ord("q")):
                     break
                 if key == ord("s"):
                     snap = f"gaze_snapshot_{frame_idx:05d}.png"
-                    cv2.imwrite(snap, annotated)
+                    cv2.imwrite(snap, composed if args.demo else annotated)
                     print(f"已保存快照: {snap}")
+                if key == ord("c") and not args.video:
+                    args.calibrate = (args.calibrate or args.calibration_file or
+                                      str(REPO_ROOT / "profiles/demo_user.json"))
+                    calibration = CalibrationSession(
+                        settle_seconds=args.calibration_settle,
+                        hold_seconds=args.calibration_hold,
+                    )
+                    print(f"开始当前窗口九点校准，合格后保存至 {args.calibrate}")
 
             fps_frames += 1
             if time.time() - fps_t0 >= 2.0:
@@ -616,6 +687,8 @@ def main() -> int:
                 break
     finally:
         cap.release()
+        if video_writer is not None:
+            video_writer.release()
         if not args.headless:
             cv2.destroyAllWindows()
         if mirror is not None:

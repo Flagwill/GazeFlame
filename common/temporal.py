@@ -12,7 +12,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from common.geometry import gazetr_angles_to_gaze
+from common.geometry import (
+    angular_error,
+    camera_gaze_to_pitch_yaw,
+    camera_pitch_yaw_to_gaze,
+    gaze_to_camera,
+    gazetr_angles_to_gaze,
+)
 
 
 class OneEuroFilter:
@@ -30,6 +36,12 @@ class OneEuroFilter:
         self._value: np.ndarray | None = None
         self._derivative: np.ndarray | None = None
         self._timestamp: float | None = None
+        self._raw_value: np.ndarray | None = None
+
+    def reset(self) -> None:
+        """Forget samples after a tracking gap or a change of coordinate frame."""
+        self._value = self._derivative = self._raw_value = None
+        self._timestamp = None
 
     @staticmethod
     def _alpha(cutoff: float, dt: float) -> float:
@@ -41,12 +53,17 @@ class OneEuroFilter:
         sample = np.asarray(value, dtype=np.float64)
         if self._value is None:
             self._value = sample.copy()
+            self._raw_value = sample.copy()
             self._derivative = np.zeros_like(sample)
             self._timestamp = now
             return self._value.copy()
 
+        if now <= float(self._timestamp):
+            return self._value.copy()
         dt = max(now - float(self._timestamp), 1e-3)
-        raw_derivative = (sample - self._value) / dt
+        # Derivatives use consecutive measurements, not the lagging filtered
+        # value. Otherwise residual filter error masquerades as eye motion.
+        raw_derivative = (sample - self._raw_value) / dt
         derivative_alpha = self._alpha(self.derivative_cutoff, dt)
         self._derivative = (
             derivative_alpha * raw_derivative
@@ -58,6 +75,7 @@ class OneEuroFilter:
         )
         self._value = alpha * sample + (1.0 - alpha) * self._value
         self._timestamp = now
+        self._raw_value = sample.copy()
         return self._value.copy()
 
 
@@ -81,6 +99,8 @@ class TemporalEstimate:
     head_euler: np.ndarray | None = None
     screen_point: np.ndarray | None = None
     events: list[dict] = field(default_factory=list)
+    camera_gaze: np.ndarray | None = None
+    measurement_valid: bool = True
 
     @property
     def event(self) -> str | None:
@@ -93,14 +113,16 @@ class GazeTemporalState:
 
     def __init__(
         self,
-        min_cutoff: float = 1.2,
-        beta: float = 0.035,
+        min_cutoff: float = 0.5,
+        beta: float = 1.2,
         fixation_velocity_deg_s: float = 35.0,
         saccade_velocity_deg_s: float = 100.0,
         fixation_min_duration: float = 0.18,
         max_missing_seconds: float = 0.35,
         blink_closed_ear: float = 0.18,
         blink_open_ear: float = 0.28,
+        spike_threshold_deg: float = 12.0,
+        min_confidence: float = 0.25,
     ):
         self._gaze_filter = OneEuroFilter(min_cutoff, beta)
         self._head_filter = OneEuroFilter(min_cutoff, beta)
@@ -110,6 +132,8 @@ class GazeTemporalState:
         self.max_missing_seconds = float(max_missing_seconds)
         self.blink_closed_ear = float(blink_closed_ear)
         self.blink_open_ear = float(blink_open_ear)
+        self.spike_threshold_deg = float(spike_threshold_deg)
+        self.min_confidence = float(min_confidence)
 
         self._last_timestamp: float | None = None
         self._last_gaze: np.ndarray | None = None
@@ -117,6 +141,13 @@ class GazeTemporalState:
         self._last_head_pose: np.ndarray | None = None
         self._last_head_euler: np.ndarray | None = None
         self._last_valid_timestamp: float | None = None
+        self._last_measurement_timestamp: float | None = None
+        self._last_raw_gaze: np.ndarray | None = None
+        self._pending_gaze: np.ndarray | None = None
+        self._pending_timestamp: float | None = None
+        self._motion_timestamp: float | None = None
+        self._motion_gaze: np.ndarray | None = None
+        self._motion_raw_gaze: np.ndarray | None = None
         self._was_valid = False
         self._low_velocity_since: float | None = None
         self._fixation_active = False
@@ -146,15 +177,22 @@ class GazeTemporalState:
     def _update_motion(
         self,
         gaze: np.ndarray,
+        raw_gaze: np.ndarray,
         timestamp: float,
         events: list[dict],
+        raw_timestamp: float | None = None,
     ) -> float:
-        if self._last_gaze is None or self._last_timestamp is None:
-            self._last_gaze = gaze.copy()
-            return 0.0
-        dt = max(timestamp - self._last_timestamp, 1e-3)
-        cosine = float(np.clip(np.dot(self._last_gaze, gaze), -1.0, 1.0))
-        speed = float(np.degrees(np.arccos(cosine)) / dt)
+        dt = timestamp - self._motion_timestamp if self._motion_timestamp is not None else 0.0
+        speed = angular_error(self._motion_gaze, gaze) / dt if dt > 0 else 0.0
+        raw_dt = (
+            (timestamp if raw_timestamp is None else raw_timestamp) - self._motion_timestamp
+            if self._motion_timestamp is not None else 0.0
+        )
+        raw_speed = angular_error(self._motion_raw_gaze, raw_gaze) / raw_dt if raw_dt > 0 else 0.0
+        # Retain real saccades even though the displayed vector is smoothed;
+        # ordinary frame noise uses the filtered speed for fixation evidence.
+        if raw_speed >= self.saccade_velocity_deg_s:
+            speed = max(speed, raw_speed)
 
         if speed >= self.saccade_velocity_deg_s:
             self._low_velocity_since = None
@@ -186,7 +224,9 @@ class GazeTemporalState:
         elif not self._saccade_active:
             self._end_fixation(timestamp, events)
 
-        self._last_gaze = gaze.copy()
+        self._motion_gaze = gaze.copy()
+        self._motion_raw_gaze = raw_gaze.copy()
+        self._motion_timestamp = timestamp
         return speed
 
     def _update_blink(
@@ -200,7 +240,7 @@ class GazeTemporalState:
         span = max(self.blink_open_ear - self.blink_closed_ear, 1e-4)
         target = float(np.clip((self.blink_open_ear - eye_aspect_ratio) / span, 0.0, 1.0))
         self._blink_value = 0.65 * self._blink_value + 0.35 * target
-        if self._blink_value >= 0.55 and not self._blinking:
+        if (eye_aspect_ratio <= self.blink_closed_ear or self._blink_value >= 0.55) and not self._blinking:
             self._blinking = True
             self._blink_started = timestamp
             events.append(self._event("blink_start", timestamp))
@@ -216,6 +256,28 @@ class GazeTemporalState:
             self._blink_started = None
         return self._blink_value
 
+    @staticmethod
+    def tracking_confidence(info: dict) -> float:
+        """Geometry/tracker quality proxy; not a learned gaze probability."""
+        error = float(info.get("reprojection_error", 0.0))
+        if not np.isfinite(error):
+            return 0.0
+        confidence = float(np.exp(-max(error, 0.0) / 8.0))
+        quality = info.get("tracking_quality")
+        if info.get("source") == "tracked" and quality is not None:
+            if not np.isfinite(quality):
+                return 0.0
+            confidence *= float(np.clip((quality - 3.0) / 4.0, 0.0, 1.0))
+        return confidence
+
+    def _reset_motion(self, now: float, events: list[dict]) -> None:
+        self._end_fixation(now, events)
+        if self._saccade_active:
+            events.append(self._event("saccade_end", now, velocity=0.0))
+        self._saccade_active = False
+        self._motion_gaze = self._motion_raw_gaze = None
+        self._motion_timestamp = None
+
     def update(
         self,
         pitch: float,
@@ -227,52 +289,113 @@ class GazeTemporalState:
     ) -> TemporalEstimate:
         """Consume one model result and return the current temporal estimate."""
         now = time.perf_counter() if timestamp is None else float(timestamp)
+        if self._last_timestamp is not None:
+            now = max(now, self._last_timestamp)
         info = info or {}
+        confidence = self.tracking_confidence(info)
         has_face = (
             face_count > 0
             and info.get("landmarks6") is not None
             and np.all(np.isfinite([pitch, yaw]))
+            and confidence >= self.min_confidence
+            and (info.get("eye_aspect_ratio") is None or np.isfinite(info["eye_aspect_ratio"]))
         )
         events: list[dict] = []
+        measurement_valid = False
+        rotation = info.get("normalization_rotation")
+        raw_camera_gaze = None
         if has_face:
-            filtered = self._gaze_filter.update([pitch, yaw], now)
-            filtered_pitch, filtered_yaw = map(float, filtered)
-            gaze = gazetr_angles_to_gaze(filtered_pitch, filtered_yaw)
-            self._last_pitch_yaw[:] = [filtered_pitch, filtered_yaw]
+            try:
+                raw_camera_gaze = gaze_to_camera(gazetr_angles_to_gaze(pitch, yaw), rotation)
+            except ValueError:
+                has_face = False
+        gap = (
+            self._last_measurement_timestamp is not None
+            and now - self._last_measurement_timestamp > self.max_missing_seconds
+        )
+        if gap:
+            self._gaze_filter.reset()
+            self._head_filter.reset()
+            self._last_raw_gaze = self._pending_gaze = None
+            self._pending_timestamp = None
+            self._reset_motion(now, events)
+        if has_face:
             self._last_valid_timestamp = now
             if not self._was_valid:
                 events.append(self._event("face_found", now))
             self._was_valid = True
-            velocity = self._update_motion(gaze, now, events)
             blink = self._update_blink(info.get("eye_aspect_ratio"), now, events)
-            error = float(info.get("reprojection_error", 0.0))
-            confidence = float(np.exp(-max(error, 0.0) / 8.0))
-            if info.get("head_pose") is not None:
+            measurement_valid = not self._blinking
+            raw_timestamp = now
+            if measurement_valid and self._last_raw_gaze is not None:
+                jump = angular_error(self._last_raw_gaze, raw_camera_gaze)
+                if jump > self.spike_threshold_deg:
+                    # One frame cannot distinguish a bad crop from a saccade.
+                    # Confirm large jumps on the next nearby measurement.
+                    measurement_valid = (
+                        self._pending_gaze is not None
+                        and angular_error(self._pending_gaze, raw_camera_gaze) <= self.spike_threshold_deg * 0.65
+                    )
+                    if measurement_valid:
+                        # Confirmation delays display by one frame, but the
+                        # movement occurred when the candidate first arrived.
+                        raw_timestamp = self._pending_timestamp
+                        self._pending_gaze = None
+                        self._pending_timestamp = None
+                    else:
+                        self._pending_gaze = raw_camera_gaze.copy()
+                        self._pending_timestamp = now
+                else:
+                    self._pending_gaze = None
+                    self._pending_timestamp = None
+            if measurement_valid:
+                camera_angles = camera_gaze_to_pitch_yaw(raw_camera_gaze)
+                filtered = self._gaze_filter.update(camera_angles, now)
+                camera_gaze = camera_pitch_yaw_to_gaze(*filtered)
+                self._last_gaze = camera_gaze.copy()
+                self._last_raw_gaze = raw_camera_gaze.copy()
+                self._last_measurement_timestamp = now
+                velocity = self._update_motion(camera_gaze, raw_camera_gaze, now, events, raw_timestamp)
+            else:
+                camera_gaze = self._last_gaze.copy() if self._last_gaze is not None else raw_camera_gaze.copy()
+                velocity = 0.0
+                if not self._blinking:
+                    confidence = min(confidence, 0.15)
+                self._end_fixation(now, events)
+                if self._blinking:
+                    self._pending_gaze = None
+                    self._pending_timestamp = None
+                    self._reset_motion(now, events)
+            # Keep the legacy normalized-frame output for callers that still
+            # need it, but consumers must use camera_gaze without another R.T.
+            gaze = camera_gaze.copy() if rotation is None else np.asarray(rotation) @ camera_gaze
+            normalized_pitch, normalized_yaw = camera_gaze_to_pitch_yaw(gaze)
+            filtered_pitch, filtered_yaw = -normalized_yaw, normalized_pitch
+            self._last_pitch_yaw[:] = [filtered_pitch, filtered_yaw]
+            if info.get("head_pose") is not None and np.all(np.isfinite(info["head_pose"])):
                 self._last_head_pose = self._head_filter.update(info["head_pose"], now)
-            if info.get("head_euler") is not None:
+            if info.get("head_euler") is not None and np.all(np.isfinite(info["head_euler"])):
                 self._last_head_euler = np.asarray(info["head_euler"], dtype=np.float64).copy()
         else:
             last_seen = self._last_valid_timestamp
             still_recent = last_seen is not None and now - last_seen <= self.max_missing_seconds
             filtered_pitch, filtered_yaw = map(float, self._last_pitch_yaw)
-            gaze = (
+            camera_gaze = (
                 self._last_gaze.copy()
                 if self._last_gaze is not None
                 else gazetr_angles_to_gaze(filtered_pitch, filtered_yaw)
             )
+            gaze = gazetr_angles_to_gaze(filtered_pitch, filtered_yaw)
             velocity = 0.0
             blink = self._blink_value
             confidence = 0.15 if still_recent else 0.0
             if self._was_valid:
                 events.append(self._event("face_lost", now))
-                self._end_fixation(now, events)
-            if self._saccade_active:
-                events.append(self._event("saccade_end", now, velocity=0.0))
-                self._saccade_active = False
+            self._reset_motion(now, events)
+            self._pending_gaze = None
+            self._pending_timestamp = None
             self._was_valid = False
 
-        if self._last_timestamp is not None and now < self._last_timestamp:
-            now = self._last_timestamp
         self._last_timestamp = now
         fixation_duration = (
             max(0.0, now - float(self._fixation_started))
@@ -296,4 +419,6 @@ class GazeTemporalState:
             head_euler=None if self._last_head_euler is None else self._last_head_euler.copy(),
             screen_point=None if screen_point is None else np.asarray(screen_point).copy(),
             events=events,
+            camera_gaze=camera_gaze,
+            measurement_valid=measurement_valid,
         )

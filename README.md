@@ -23,6 +23,22 @@ Pitch / Yaw (弧度)
 ```
 
 
+## 结题 / 答辩 Demo（含 webcam 实时全链路）
+
+```bash
+./run_demo.sh --camera 0                 # 推荐：webcam → 对齐 → GazeTR → FLAME → 辅助意图
+./run_demo.sh --camera 0 --windowed      # 普通窗口，便于现场录屏
+./run_demo.sh --video driver.mp4         # 视频逐帧真实推理，同一全链路面板
+./run_demo.sh                            # 真实单图开场 + 明确标注的合成状态回放（约27秒）
+./run_demo.sh --headless --save-video demo_outputs/report_demo.mp4
+./run_demo.sh --skip-image --no-flame --headless  # 无摄像头/GL的规则演示
+```
+
+实时演示默认启用 FLAME 和驾驶员辅助概念层，展示原始输入、实际网络对齐裁剪、三维头眼、
+驾驶舱关注区域、注视意图、原始/滤波角度曲线及事件记录。默认 CPU，并保留原有 ROCm
+安全保护。`ASSIST READY` 仅表示软件准备状态，不发送机械臂、飞控或执行器命令。
+详细操作、个人校准、答辩讲解顺序、输出文件和研究边界见 **[docs/DEMO.md](docs/DEMO.md)**。
+
 ## 目录结构
 
 ```
@@ -33,6 +49,7 @@ GazeFlame/
 │   ├── flame_mirror.py      FLAME 离屏渲染 + 单窗口合成 (compose_with_head)
 │   ├── viz.py               2D 视线标注 (draw_overlay, 摄像头/图片共用)
 │   ├── assistive.py         视线目标/意图/辅助状态概念层与状态面板
+│   ├── demo.py              全链路演示面板与明确标注的合成回放场景
 │   ├── download_dlib_model.py 下载 dlib 68点模型 (需联网, 一次性)
 │   └── models/              dlib shape_predictor 模型 (gitignore)
 ├── environment.yml          conda 环境定义 (name: gaze_flame_rocm)
@@ -40,6 +57,9 @@ GazeFlame/
 ├── run_gaze_to_flame.py     一键编排脚本 (GazeTR → FLAME, 统一单窗口)
 ├── run_webcam.py            实时摄像头/视频流视线追踪 (统一单窗口)
 ├── run_webcam.sh            摄像头一键脚本 (自动定位 conda 环境)
+├── run_demo.py / run_demo.sh 结题演示：真实webcam/视频全链路 + 单图/合成回放
+├── docs/DEMO.md              演示使用与答辩讲解说明
+├── profiles/                本地个人校准 JSON（gitignore，首次使用需自行校准）
 ├── gazetr/                  原 GazeTR 项目
 │   ├── inference.py         推理入口 (含人脸对齐)
 │   ├── model.py / resnet.py GazeTR 网络定义
@@ -194,12 +214,17 @@ ETH-XGaze 对齐 → GazeTR 推理（CPU 下本机实测约 **10fps**，受摄�
 `--calibration-file profiles/me.json` 后会使用九点个人校准得到的坐标，标记精度更高。
 校准只影响屏幕落点，不会改写 FLAME 的真实视线向量；每个目标点取稳定阶段的中位数，
 可减少眨眼、跟踪抖动对 profile 的影响。RMSE 大于 0.15 的校准文件会被忽略，需重新校准。
+新校准同时检查留一目标验证误差、角度覆盖与映射增益；失败不会覆盖原文件。实时窗口按
+`c` 可重新校准。demo 请用 `./run_demo.sh --camera 0 --calibrate profiles/demo_user.json`
+在实际演示窗口完成校准，并保持相同窗口大小和坐姿，见 [demo 校准说明](docs/DEMO.md)。
 旧版 profile 使用的是未补偿头姿的角度坐标，首次升级后请重新运行一次 `--calibrate`。
 
 ### 实时增强
 
-- `common.temporal.GazeTemporalState` 使用 One Euro 滤波降低角度抖动，计算角速度，
-  并输出 `face_found/face_lost`、`blink_start/blink_end`、`fixation_start/fixation_end`
+- `common.temporal.GazeTemporalState` 先还原相机系视线再用自适应 One Euro 滤波，默认
+  cutoff=0.5Hz、beta=1.2；闭眼/低质量帧不更新，超过 12° 的单帧跳变须下一帧确认。
+  `TemporalEstimate.camera_gaze` 是完整滤波后的相机向量，勿再次乘归一化旋转。时域状态
+  同时计算角速度并输出 `face_found/face_lost`、`blink_start/blink_end`、`fixation_start/fixation_end`
   和 `saccade_start/saccade_end` 事件。事件可用 `--events-out` 保存为 JSON。
 - `common.face` 从同一组 68 点关键点提供 EAR、solvePnP 头部轴角和重投影误差；
   FLAME 的头部、左右眼、上下眼睑是分层节点，头部转动不会再被误当成眼球转动。

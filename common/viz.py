@@ -233,15 +233,13 @@ def draw_overlay(
             display_point = temporal.screen_point
 
     scale = max(0.6, min(w, h) / 720.0)
+    readout = (f"pitch {np.degrees(readout_pitch):+6.1f} deg  "
+               f"yaw {np.degrees(readout_yaw):+6.1f} deg")
+    text_width = cv2.getTextSize(readout, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)[0][0]
+    readout_scale = scale * min(1.0, max(1, w - 20) / max(text_width, 1))
     cv2.putText(
-        out,
-        f"pitch {np.degrees(readout_pitch):+6.1f} deg  "
-        f"yaw {np.degrees(readout_yaw):+6.1f} deg",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        (255, 255, 255),
-        2,
+        out, readout, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, readout_scale,
+        (255, 255, 255), 1 if readout_scale < 0.5 else 2,
     )
     if temporal is not None:
         status = "face" if temporal.valid else "no face"
@@ -288,6 +286,7 @@ def draw_calibration_target(
     point: tuple[float, float],
     progress: float = 0.0,
     label: str = "CALIBRATION",
+    status: str | None = None,
 ) -> np.ndarray:
     """Draw a high-contrast timed calibration target over a camera frame."""
     out = frame.copy()
@@ -298,8 +297,14 @@ def draw_calibration_target(
     cv2.circle(out, center, radius + 8, (255, 255, 255), 3, cv2.LINE_AA)
     cv2.circle(out, center, radius, (0, 70, 255), -1, cv2.LINE_AA)
     cv2.circle(out, center, max(3, radius // 5), (255, 255, 255), -1, cv2.LINE_AA)
-    cv2.putText(out, label, (12, h - 42), cv2.FONT_HERSHEY_SIMPLEX,
-                max(0.55, min(w, h) / 900.0), (255, 255, 255), 2)
+    for text, y in ((label, h - (66 if status else 42)), (status, h - 42)):
+        if text is None:
+            continue
+        scale = max(0.55, min(w, h) / 900.0)
+        text_width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0]
+        scale *= min(1.0, max(1, w - 24) / max(text_width, 1))
+        cv2.putText(out, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (255, 255, 255), 1, cv2.LINE_AA)
     bar_w = max(120, int(w * 0.35))
     x0 = (w - bar_w) // 2
     y0 = h - 20
